@@ -169,7 +169,7 @@ fn play_game(
     }
 
     // 🎯 ÁP DỤNG CÔNG THỨC ALPHA = 0.8
-    let alpha = 0.9;
+    let alpha = 0.0;
     match winner {
         None => game_records
             .into_iter()
