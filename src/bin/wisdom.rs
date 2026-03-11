@@ -1,6 +1,6 @@
 use wisdom::ucci::ucci_loop;
 
-const MODEL_PATH: &str = "./wisdom_models/wisdom_net_v0.onnx";
+const MODEL_PATH: &str = "./wisdom_models/wisdom_net_v1.onnx";
 
 fn start_engine() {
     println!("📦 Khởi tạo ONNX model từ: {}", MODEL_PATH);

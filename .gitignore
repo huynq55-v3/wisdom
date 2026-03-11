@@ -3,3 +3,5 @@ xiangqi_net_latest.mpk
 temp_transfer.mpk
 replay_buffer.csv
 wisdom_models/temp_train_transfer.mpk
+arena_results.pgn
+kernel.errors.txt
