@@ -95,10 +95,12 @@ impl Move {
         from90 * 90 + to90
     }
 
+    #[allow(dead_code)]
     fn flip_sq90(sq90: usize) -> usize {
         89 - sq90
     }
 
+    #[allow(dead_code)]
     fn flip_action_index(idx: usize) -> usize {
         let from_sq90 = idx / 90;
         let to_sq90 = idx % 90;

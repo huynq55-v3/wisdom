@@ -69,7 +69,7 @@ fn get_all_legal_moves(board: &mut Board) -> Vec<Move> {
     legal_moves
 }
 
-fn play_game(eval_tx: &Sender<EvalRequest>, tt: &Arc<TranspositionTable>) -> Vec<SelfPlayItem> {
+fn play_game(eval_tx: &Sender<EvalRequest>) -> Vec<SelfPlayItem> {
     let mut board = Board::new();
     board.set_initial_position();
     let mut history = Vec::new();
@@ -78,9 +78,9 @@ fn play_game(eval_tx: &Sender<EvalRequest>, tt: &Arc<TranspositionTable>) -> Vec
     let mut move_count = 0;
     let winner: Option<Color>;
 
-    // 🎯 Có thể tăng số này lên 4000 như bác đã test để chất lượng FEN tốt hơn
+    let local_tt = Arc::new(TranspositionTable::new(1));
     let simulations = 800;
-    let mcts = MCTS::new(2_000_000);
+    let mcts = MCTS::new(500_000);
 
     loop {
         let legal_moves = get_all_legal_moves(&mut board);
@@ -116,7 +116,7 @@ fn play_game(eval_tx: &Sender<EvalRequest>, tt: &Arc<TranspositionTable>) -> Vec
         }
 
         let (best_move, metrics) =
-            mcts.search_best_move(&board, &history, simulations, eval_tx, tt, 1, true);
+            mcts.search_best_move(&board, &history, simulations, eval_tx, &local_tt, 1, true);
 
         // In dấu chấm để báo hiệu game đang chạy mượt
         print!(".");
@@ -167,7 +167,7 @@ fn play_game(eval_tx: &Sender<EvalRequest>, tt: &Arc<TranspositionTable>) -> Vec
     }
 
     // 🎯 ÁP DỤNG CÔNG THỨC ALPHA = 0.8
-    let alpha = 0.8;
+    let alpha = 0.9;
     match winner {
         None => game_records
             .into_iter()
@@ -218,17 +218,15 @@ fn main() {
     println!(
         "🔄 Số vòng         : {} (Tổng {} games)",
         rounds,
-        rounds * 128
+        rounds * 512
     );
-    println!("⚙️ Batch Size      : 128 | Timeout: 100 µs");
+    println!("⚙️ Batch Size      : 512 | Timeout: 100 µs");
     println!("============================================================\n");
 
     // Tải mô hình OpenVINO / ONNX
     let onnx_model = XiangqiOnnx::new(&model_path);
 
-    // 3. Khởi tạo EvalQueue với Batch 128 và Timeout 100 micro giây
-    let eval_queue = EvalQueue::new(onnx_model, 128, 100);
-    let shared_tt = Arc::new(TranspositionTable::new(8192)); // Có thể tăng TT size vì chạy nhiều game
+    let eval_queue = EvalQueue::new(onnx_model, 512, 100);
     let all_generated_data = Arc::new(Mutex::new(Vec::new()));
 
     let start_time = Instant::now();
@@ -238,13 +236,12 @@ fn main() {
 
         // 4. Khởi tạo chính xác 128 luồng bằng std::thread::scope
         std::thread::scope(|s| {
-            for _ in 0..128 {
+            for _ in 0..512 {
                 let tx = &eval_queue.tx;
-                let tt_clone = Arc::clone(&shared_tt);
                 let data_clone = Arc::clone(&all_generated_data);
 
                 s.spawn(move || {
-                    let records = play_game(tx, &tt_clone);
+                    let records = play_game(tx);
                     data_clone.lock().unwrap().extend(records);
                 });
             }

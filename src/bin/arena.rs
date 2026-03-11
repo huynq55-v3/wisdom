@@ -1,29 +1,18 @@
-use burn::backend::wgpu::WgpuDevice;
-use burn::record::NamedMpkFileRecorder;
-use burn::record::Recorder;
-use burn::prelude::*;
-use burn::backend::Wgpu;
-use crossbeam_channel::Sender;
 use std::env;
 use std::fs::File;
-use std::io::{Write, BufWriter};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use crossbeam_channel::Sender;
 
 use wisdom::board::{Board, Color, HistoryEntry, PieceType, RepetitionResult};
-use wisdom::mcts::MCTS;
 use wisdom::eval_queue::{EvalQueue, EvalRequest};
-use wisdom::nn::XiangqiNetConfig;
+use wisdom::mcts::MCTS;
+use wisdom::nn::XiangqiOnnx; // 🎯 SỬA: Đã chuyển sang dùng ONNX Runtime
+use wisdom::r#move::Move;
 use wisdom::tt::TranspositionTable;
 use wisdom::ucci::move_to_ucci_string;
-
-type MyBackend = Wgpu<f32, i32>;
-
-#[derive(Clone)]
-pub struct ArenaConfig {
-    pub num_games: usize,
-    pub simulations: usize,
-    pub pgn_out: String,
-}
 
 #[derive(Clone, Copy, PartialEq)]
 enum GameResult {
@@ -40,7 +29,7 @@ fn result_to_string(res: &GameResult) -> &'static str {
     }
 }
 
-fn get_all_legal_moves(board: &mut Board) -> Vec<wisdom::r#move::Move> {
+fn get_all_legal_moves(board: &mut Board) -> Vec<Move> {
     let mut all_moves = board.generate_captures();
     all_moves.append(&mut board.generate_quiets());
     let mut legal_moves = Vec::new();
@@ -57,22 +46,30 @@ fn get_all_legal_moves(board: &mut Board) -> Vec<wisdom::r#move::Move> {
     legal_moves
 }
 
+// ==========================================================
+// HÀM CHƠI 1 VÁN CỜ (ARENA)
+// ==========================================================
 fn play_arena_game(
+    start_fen: &str,
     red_tx: &Sender<EvalRequest>,
     black_tx: &Sender<EvalRequest>,
     sims: usize,
 ) -> (GameResult, String) {
-    let mut board = Board::new();
-    board.set_initial_position();
+    let mut board = Board::from_fen(start_fen).expect("Lỗi đọc FEN khởi tạo");
     let mut history = Vec::new();
     let mut pgn_moves = String::new();
-    let mcts = MCTS::new(100_000); 
-    
-    // Independent TT for each game!
-    let tt = Arc::new(TranspositionTable::new(1024));
+
+    // 🎯 2 CÂY MCTS RIÊNG BIỆT CHO 2 MODEL (Ngăn chặn đọc trộm suy nghĩ)
+    let mcts_red = MCTS::new(500_000);   // Đủ cho 800 sims
+    let mcts_black = MCTS::new(500_000); 
+
+    // 🎯 2 BẢNG TT (HASH) RIÊNG BIỆT (Size: 1MB mỗi bảng)
+    let tt_red = TranspositionTable::new(2);
+    let tt_black = TranspositionTable::new(2);
 
     let mut move_count = 0;
-    let mut move_number = 1;
+    // PGN move number đếm tiếp từ vị trí FEN (thường là nước 5 hoặc 6)
+    let mut move_number = 1; 
 
     loop {
         let legal_moves = get_all_legal_moves(&mut board);
@@ -105,9 +102,14 @@ fn play_arena_game(
             _ => {}
         }
 
-        let current_tx = if board.side_to_move == Color::Red { red_tx } else { black_tx };
-        
-        let (best_move, _) = mcts.search_best_move(&board, &history, sims, current_tx, &tt, 1, false);
+        // 🎯 LỰA CHỌN MCTS & TT THEO LƯỢT ĐI
+        let (best_move, _) = if board.side_to_move == Color::Red {
+            // Lượt Đỏ: Dùng Não Đỏ (MCTS Đỏ + Queue Đỏ + Hash Đỏ)
+            mcts_red.search_best_move(&board, &history, sims, red_tx, &tt_red, 1, false)
+        } else {
+            // Lượt Đen: Dùng Não Đen (MCTS Đen + Queue Đen + Hash Đen)
+            mcts_black.search_best_move(&board, &history, sims, black_tx, &tt_black, 1, false)
+        };
 
         if board.side_to_move == Color::Red {
             pgn_moves.push_str(&format!("{}. {} ", move_number, move_to_ucci_string(best_move)));
@@ -116,6 +118,7 @@ fn play_arena_game(
             pgn_moves.push_str(&format!("{} ", move_to_ucci_string(best_move)));
         }
 
+        // Cập nhật bàn cờ và lịch sử (Giữ nguyên logic của bác)
         let is_capture = board.piece_at(best_move.to_sq()).is_some();
         let piece = board.piece_at(best_move.from_sq()).unwrap();
         let is_reversible = !is_capture && (piece.piece_type != PieceType::Pawn || {
@@ -146,122 +149,168 @@ fn play_arena_game(
     }
 }
 
+// ==========================================================
+// HÀM MAIN - QUẢN LÝ ĐA LUỒNG & BATCHING
+// ==========================================================
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 4 {
-        eprintln!("Cách dùng: cargo run --bin arena --release <MODEL_V0_PATH> <MODEL_V1_PATH> <NUM_GAMES> [PGN_OUT_FILE]");
+    if args.len() < 3 {
+        eprintln!("Cách dùng: cargo run --bin arena --release <MODEL_V0_PATH> <MODEL_V1_PATH> [PGN_OUT_FILE]");
         std::process::exit(1);
     }
 
     let model_v0_path = &args[1];
     let model_v1_path = &args[2];
-    let num_games: usize = args[3].parse().expect("NUM_GAMES phải là một số nguyên dương");
-    let pgn_out = if args.len() > 4 { args[4].clone() } else { "arena_results.pgn".to_string() };
+    let pgn_out = if args.len() > 3 { args[3].clone() } else { "arena_results.pgn".to_string() };
 
-    println!("⚔️  Bắt đầu trận đấu: {} vs {}", model_v0_path, model_v1_path);
-    println!("🎮 Tổng số ván đấu: {}", num_games);
+    let simulations = 400; // Hoặc 800 tùy ý bác
 
-    let device = WgpuDevice::default();
-    let config = XiangqiNetConfig::new();
-
-    println!("📥 Loading Model 0 from '{}'...", model_v0_path);
-    let recorder_v0 = NamedMpkFileRecorder::<burn::record::FullPrecisionSettings>::default();
-    let record_v0 = Recorder::load(&recorder_v0, model_v0_path.into(), &device)
-        .expect("Failed to load Model 0");
-    let model_v0 = config.init::<MyBackend>(&device).load_record(record_v0);
-
-    println!("📥 Loading Model 1 from '{}'...", model_v1_path);
-    let recorder_v1 = NamedMpkFileRecorder::<burn::record::FullPrecisionSettings>::default();
-    let record_v1 = Recorder::load(&recorder_v1, model_v1_path.into(), &device)
-        .expect("Failed to load Model 1");
-    let model_v1 = config.init::<MyBackend>(&device).load_record(record_v1);
-
-    let cfg = ArenaConfig {
-        num_games,
-        simulations: 400,
-        pgn_out: pgn_out.clone(),
+    // 1. ĐỌC FILE FEN KHAI CUỘC (Đảm bảo file startFEN.txt nằm cùng thư mục chạy lệnh)
+    let fen_file_path = "startFEN.txt";
+    let fens: Vec<String> = {
+        let file = File::open(fen_file_path).expect("Không tìm thấy file startFEN.txt");
+        let reader = BufReader::new(file);
+        reader.lines().map(|l| l.unwrap().trim().to_string()).filter(|l| !l.is_empty()).collect()
     };
+    
+    // Yêu cầu: 256 FEN. Nếu thiếu/thừa hệ thống vẫn chạy dựa trên số lượng file thực tế
+    let num_fens = fens.len();
+    let total_games = num_fens * 2; // Đổi màu quân -> Tổng 512 ván
 
-    let pgn_file = File::create(&cfg.pgn_out).expect("Không tạo được file PGN");
+    println!("=====================================================");
+    println!("⚔️  ARENA THI ĐẤU: {} vs {}", model_v0_path, model_v1_path);
+    println!("📖 Khai cuộc       : Đã nạp {} FENs từ '{}'", num_fens, fen_file_path);
+    println!("🎮 Tổng số ván đấu : {} (Mỗi bên cầm Đỏ 50%)", total_games);
+    println!("🧠 Simulations     : {}", simulations);
+    println!("=====================================================\n");
+
+    // 2. TẢI 2 MODEL ONNX (Dùng CPU hoặc GPU tùy thuộc cấu hình ONNX Runtime của bác)
+    println!("📥 Đang nạp Model V0 (Cũ)...");
+    let model_v0 = XiangqiOnnx::new(model_v0_path);
+    println!("📥 Đang nạp Model V1 (Mới)...");
+    let model_v1 = XiangqiOnnx::new(model_v1_path);
+
+    // 3. KHỞI TẠO 2 ỐNG NƯỚC (EVAL QUEUE) ĐỘC LẬP
+    // Batch 128 (hoặc 64) là vừa đủ để GPU nhai mượt mà từ 128 luồng
+    let queue_v0 = EvalQueue::new(model_v0, 128, 100); 
+    let queue_v1 = EvalQueue::new(model_v1, 128, 100);
+
+    let pgn_file = File::create(&pgn_out).expect("Không tạo được file PGN");
     let pgn_writer = Arc::new(Mutex::new(BufWriter::new(pgn_file)));
 
     let v0_wins = Arc::new(Mutex::new(0));
     let v1_wins = Arc::new(Mutex::new(0));
     let draws = Arc::new(Mutex::new(0));
+    let games_completed = Arc::new(Mutex::new(0));
 
-    let queue_v0 = EvalQueue::new(model_v0.clone(), device.clone(), 64, 1);
-    let queue_v1 = EvalQueue::new(model_v1.clone(), device.clone(), 64, 1);
+    let start_time = Instant::now();
+
+    // 4. QUẢN LÝ LUỒNG (THREAD POOLING TỰ CHẾ ĐỂ TRÁNH NGỘP OS)
+    // Hệ điều hành không thích 512 luồng chạy CÙNG LÚC. Ta chia thành các mẻ nhỏ (ví dụ 128 luồng chạy đồng thời)
+    // Mỗi luồng cày xong ván này sẽ bốc ván khác cày tiếp.
     
-    let concurrent_games = 16.min(num_games);
-    let total_batches = (num_games + concurrent_games - 1) / concurrent_games;
+    // Tạo danh sách 512 cấu hình trận đấu (FEN, Ai_Cầm_Đỏ)
+    let mut match_configs = Vec::with_capacity(total_games);
+    for (i, fen) in fens.iter().enumerate() {
+        // Ván 1: V1 cầm Đỏ, V0 cầm Đen
+        match_configs.push((i * 2, fen.clone(), true));  
+        // Ván 2: V0 cầm Đỏ, V1 cầm Đen (Đảo màu)
+        match_configs.push((i * 2 + 1, fen.clone(), false)); 
+    }
+
+    let shared_configs = Arc::new(Mutex::new(match_configs.into_iter()));
     
-    for batch_idx in 0..total_batches {
-        let games_in_batch = std::cmp::min(
-            concurrent_games,
-            num_games - batch_idx * concurrent_games,
-        );
+    // Tối đa 128 luồng hoạt động song song
+    let max_concurrent_threads = 128; 
 
-        std::thread::scope(|s| {
-            for inner_idx in 0..games_in_batch {
-                let game_id = batch_idx * concurrent_games + inner_idx;
-                let tx_v0 = &queue_v0.tx;
-                let tx_v1 = &queue_v1.tx;
-                let pgn_writer_clone = Arc::clone(&pgn_writer);
-                
-                let v0_w = Arc::clone(&v0_wins);
-                let v1_w = Arc::clone(&v1_wins);
-                let dr = Arc::clone(&draws);
+    std::thread::scope(|s| {
+        for _ in 0..max_concurrent_threads {
+            let configs_clone = Arc::clone(&shared_configs);
+            let tx_v0 = &queue_v0.tx;
+            let tx_v1 = &queue_v1.tx;
+            
+            let pgn_writer_clone = Arc::clone(&pgn_writer);
+            let v0_w = Arc::clone(&v0_wins);
+            let v1_w = Arc::clone(&v1_wins);
+            let dr = Arc::clone(&draws);
+            let gc = Arc::clone(&games_completed);
 
-                let cfg_clone = cfg.clone();
-
-                s.spawn(move || {
-                    let is_v1_red = game_id % 2 == 0;
-                    let (red_tx, black_tx) = if is_v1_red {
-                        (tx_v1, tx_v0)
-                    } else {
-                        (tx_v0, tx_v1)
+            s.spawn(move || {
+                loop {
+                    // Bốc 1 ván cờ từ danh sách
+                    let config = {
+                        let mut it = configs_clone.lock().unwrap();
+                        it.next()
                     };
 
-                    println!("🎮 Trận {}/{} - V1 cầm {}: Đang thi đấu...", game_id + 1, cfg_clone.num_games, if is_v1_red {"Đỏ"} else {"Đen"});
-                    
-                    let (result, pgn_content) = play_arena_game(red_tx, black_tx, cfg_clone.simulations);
+                    match config {
+                        Some((game_id, start_fen, is_v1_red)) => {
+                            // Cấp phát ống nước đúng chủ nhân
+                            let (red_tx, black_tx) = if is_v1_red {
+                                (tx_v1, tx_v0)
+                            } else {
+                                (tx_v0, tx_v1)
+                            };
 
-                    {
-                        let mut f = pgn_writer_clone.lock().unwrap();
-                        let red_player = if is_v1_red { "Model V1" } else { "Model V0" };
-                        let black_player = if is_v1_red { "Model V0" } else { "Model V1" };
+                            let (result, pgn_content) = play_arena_game(&start_fen, red_tx, black_tx, simulations);
 
-                        writeln!(f, "[Event \"Arena v0 vs v1\"]\n[Round \"{}\"]\n[White \"{}\"]\n[Black \"{}\"]\n[Result \"{}\"]\n{}\n", 
-                            game_id + 1, red_player, black_player, result_to_string(&result), pgn_content.trim()).unwrap();
-                        f.flush().unwrap();
+                            // --- Ghi PGN ---
+                            {
+                                let mut f = pgn_writer_clone.lock().unwrap();
+                                let red_player = if is_v1_red { "Model V1 (Mới)" } else { "Model V0 (Cũ)" };
+                                let black_player = if is_v1_red { "Model V0 (Cũ)" } else { "Model V1 (Mới)" };
+
+                                writeln!(f, "[Event \"Arena v0 vs v1\"]\n[Round \"{}\"]\n[White \"{}\"]\n[Black \"{}\"]\n[Result \"{}\"]\n[FEN \"{}\"]\n{}\n", 
+                                    game_id + 1, red_player, black_player, result_to_string(&result), start_fen, pgn_content.trim()).unwrap();
+                                f.flush().unwrap();
+                            }
+
+                            // --- Cập nhật điểm số ---
+                            {
+                                let mut current_v0 = v0_w.lock().unwrap();
+                                let mut current_v1 = v1_w.lock().unwrap();
+                                let mut current_draws = dr.lock().unwrap();
+                                let mut current_completed = gc.lock().unwrap();
+
+                                match result {
+                                    GameResult::RedWin => if is_v1_red { *current_v1 += 1 } else { *current_v0 += 1 },
+                                    GameResult::BlackWin => if is_v1_red { *current_v0 += 1 } else { *current_v1 += 1 },
+                                    GameResult::Draw => *current_draws += 1,
+                                }
+                                *current_completed += 1;
+                                
+                                println!("🏁 Xong Trận {}/{}. 📊 Tỉ số hiện tại - V1: {} | V0: {} | Hòa: {}", 
+                                    *current_completed, total_games, *current_v1, *current_v0, *current_draws);
+                            }
+                        }
+                        None => break, // Hết việc, luồng này tự động thoát
                     }
-
-                    let mut current_v0 = v0_w.lock().unwrap();
-                    let mut current_v1 = v1_w.lock().unwrap();
-                    let mut current_draws = dr.lock().unwrap();
-
-                    match result {
-                        GameResult::RedWin => if is_v1_red { *current_v1 += 1 } else { *current_v0 += 1 },
-                        GameResult::BlackWin => if is_v1_red { *current_v0 += 1 } else { *current_v1 += 1 },
-                        GameResult::Draw => *current_draws += 1,
-                    }
-                    
-                    println!("🏁 Hoàn thành Trận {}. 📊 Tỉ số: V1: {} | V0: {} | Hòa: {}", 
-                        game_id + 1, *current_v1, *current_v0, *current_draws);
-                });
-            }
-        });
-    }
+                }
+            });
+        }
+    });
 
     let final_v1 = *v1_wins.lock().unwrap();
     let final_v0 = *v0_wins.lock().unwrap();
     let final_draws = *draws.lock().unwrap();
+    
+    // Tính Winrate cho V1 (Thắng 1 điểm, Hòa 0.5 điểm)
+    let v1_score = final_v1 as f32 + (final_draws as f32 / 2.0);
+    let winrate = (v1_score / total_games as f32) * 100.0;
 
+    println!("\n=====================================================");
+    println!("🏆 KẾT QUẢ CHUNG CUỘC SAU {:.2?}", start_time.elapsed());
+    println!("🟢 Model V1 (Mới) thắng : {}", final_v1);
+    println!("🔴 Model V0 (Cũ) thắng  : {}", final_v0);
+    println!("⚪ Hòa                  : {}", final_draws);
+    println!("📈 WINRATE CỦA V1       : {:.2}%", winrate);
     println!("=====================================================");
-    println!("🏆 KẾT QUẢ CHUNG CUỘC TỪ {} VÁN", num_games);
-    println!("🟢 Model V1 thắng: {}", final_v1);
-    println!("🔴 Model V0 thắng: {}", final_v0);
-    println!("⚪ Hòa: {}", final_draws);
-    println!("=====================================================");
-    println!("💾 Lịch sử các ván đấu đã được lưu tại {}", cfg.pgn_out);
+    
+    if winrate > 55.0 {
+        println!("🎉 KẾT LUẬN: MODEL V1 ĐÃ VƯỢT TRỘI, ĐỦ ĐIỀU KIỆN LÊN NGÔI!");
+    } else {
+        println!("⚠️ KẾT LUẬN: Model V1 chưa đủ mạnh (Winrate < 55%), cần cày thêm Data.");
+    }
+    
+    println!("💾 Lịch sử các ván đấu đã được lưu tại {}", pgn_out);
 }
