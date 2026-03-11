@@ -69,7 +69,10 @@ fn get_all_legal_moves(board: &mut Board) -> Vec<Move> {
     legal_moves
 }
 
-fn play_game(eval_tx: &Sender<EvalRequest>) -> Vec<SelfPlayItem> {
+fn play_game(
+    eval_tx: &Sender<EvalRequest>,
+    shared_tt: &Arc<TranspositionTable>,
+) -> Vec<SelfPlayItem> {
     let mut board = Board::new();
     board.set_initial_position();
     let mut history = Vec::new();
@@ -78,7 +81,6 @@ fn play_game(eval_tx: &Sender<EvalRequest>) -> Vec<SelfPlayItem> {
     let mut move_count = 0;
     let winner: Option<Color>;
 
-    let local_tt = Arc::new(TranspositionTable::new(1));
     let simulations = 800;
     let mcts = MCTS::new(500_000);
 
@@ -116,7 +118,7 @@ fn play_game(eval_tx: &Sender<EvalRequest>) -> Vec<SelfPlayItem> {
         }
 
         let (best_move, metrics) =
-            mcts.search_best_move(&board, &history, simulations, eval_tx, &local_tt, 1, true);
+            mcts.search_best_move(&board, &history, simulations, eval_tx, shared_tt, 1, true);
 
         // In dấu chấm để báo hiệu game đang chạy mượt
         print!(".");
@@ -228,6 +230,7 @@ fn main() {
 
     let eval_queue = EvalQueue::new(onnx_model, 512, 100);
     let all_generated_data = Arc::new(Mutex::new(Vec::new()));
+    let shared_tt = Arc::new(TranspositionTable::new(16384));
 
     let start_time = Instant::now();
 
@@ -239,9 +242,10 @@ fn main() {
             for _ in 0..512 {
                 let tx = &eval_queue.tx;
                 let data_clone = Arc::clone(&all_generated_data);
+                let tt_clone = Arc::clone(&shared_tt);
 
                 s.spawn(move || {
-                    let records = play_game(tx);
+                    let records = play_game(tx, &tt_clone);
                     data_clone.lock().unwrap().extend(records);
                 });
             }
