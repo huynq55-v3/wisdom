@@ -163,7 +163,7 @@ fn main() {
     let model_v1_path = &args[2];
     let pgn_out = if args.len() > 3 { args[3].clone() } else { "arena_results.pgn".to_string() };
 
-    let simulations = 400; // Hoặc 800 tùy ý bác
+    let simulations = 800; // Hoặc 800 tùy ý bác
 
     // 1. ĐỌC FILE FEN KHAI CUỘC (Đảm bảo file startFEN.txt nằm cùng thư mục chạy lệnh)
     let fen_file_path = "startFEN.txt";
@@ -192,8 +192,8 @@ fn main() {
 
     // 3. KHỞI TẠO 2 ỐNG NƯỚC (EVAL QUEUE) ĐỘC LẬP
     // Batch 128 (hoặc 64) là vừa đủ để GPU nhai mượt mà từ 128 luồng
-    let queue_v0 = EvalQueue::new(model_v0, 128, 100); 
-    let queue_v1 = EvalQueue::new(model_v1, 128, 100);
+    let queue_v0 = EvalQueue::new(model_v0, 512, 100); 
+    let queue_v1 = EvalQueue::new(model_v1, 512, 100);
 
     let pgn_file = File::create(&pgn_out).expect("Không tạo được file PGN");
     let pgn_writer = Arc::new(Mutex::new(BufWriter::new(pgn_file)));
@@ -221,7 +221,7 @@ fn main() {
     let shared_configs = Arc::new(Mutex::new(match_configs.into_iter()));
     
     // Tối đa 128 luồng hoạt động song song
-    let max_concurrent_threads = 128; 
+    let max_concurrent_threads = 512; 
 
     std::thread::scope(|s| {
         for _ in 0..max_concurrent_threads {
