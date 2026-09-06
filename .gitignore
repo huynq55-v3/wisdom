@@ -5,3 +5,4 @@ replay_buffer.csv
 wisdom_models/temp_train_transfer.mpk
 arena_results.pgn
 kernel.errors.txt
+__pycache__

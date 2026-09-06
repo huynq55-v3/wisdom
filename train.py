@@ -75,14 +75,13 @@ class XiangqiDataset(Dataset):
             csv_file,
             header=None,
             names=['fen', 'value', 'policy'],
-            dtype={'fen': str, 'value': np.float32, 'policy': np.int32}
+            dtype={'fen': str, 'value': np.float32, 'policy': str}
         )
-        # Lọc bỏ và không đưa vào training các mẫu có index < 0 hoặc >= 8100 
-        valid_mask = (self.data['policy'] >= 0) & (self.data['policy'] < 8100)
+        valid_mask = self.data['policy'].notna() & (self.data['policy'].str.len() > 0)
         invalid_count = len(self.data) - valid_mask.sum()
         self.data = self.data[valid_mask].reset_index(drop=True)
         if invalid_count > 0:
-            print(f"Bỏ qua hoàn toàn {invalid_count} vị trí có action index không hợp lệ.")
+            print(f"Bỏ qua hoàn toàn {invalid_count} vị trí có policy không hợp lệ.")
             
         print(f"Đã nạp {len(self.data)} positions hợp lệ.")
 
@@ -92,42 +91,76 @@ class XiangqiDataset(Dataset):
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
         fen = row['fen']
-        stm = fen.split()[1].lower() if len(fen.split()) > 1 else 'w'
-
-        try:
-            absolute_idx = int(row['policy'])
-        except (ValueError, OverflowError):
-            absolute_idx = -1
-
-        # Tránh lỗi nếu bằng cách nào đó vẫn lọt vào __getitem__
-        if absolute_idx < 0 or absolute_idx >= 8100:
-            import random
-            return self.__getitem__(random.randint(0, len(self) - 1))
+        policy_raw = str(row['policy']).strip()
 
         board_tensor = fen_to_tensor(fen)
-
-        # GIẢI NÉN TỌA ĐỘ TUYỆT ĐỐI (Dựa trên mảng 90 ô)
-        from_sq90 = absolute_idx // 90
-        to_sq90 = absolute_idx % 90
-
-        # Nếu là Đen -> Lật mặt thành "Nước đi ảo"
-        if stm == 'b':
-            from_sq90 = flip_sq90(from_sq90)
-            to_sq90 = flip_sq90(to_sq90)
-
-        # 2. DATA AUGMENTATION: 50% cơ hội lật đối xứng Trái - Phải
-        if torch.rand(1).item() < 0.5:
+        is_mirror = torch.rand(1).item() < 0.5
+        if is_mirror:
             board_tensor = torch.flip(board_tensor, dims=[2])
-            from_sq90 = mirror_sq90_left_right(from_sq90)
-            to_sq90 = mirror_sq90_left_right(to_sq90)
 
-        # Tính toán lại Index cho không gian 8100
-        policy_idx = from_sq90 * 90 + to_sq90
+        target_policy = np.zeros(8100, dtype=np.float32)
+
+        if ':' in policy_raw:
+            # Định dạng mới: Phân phối xác suất thưa (act1:visits1;act2:visits2;...)
+            entries = policy_raw.split(';')
+            actions = []
+            visits = []
+            for entry in entries:
+                if not entry:
+                    continue
+                parts = entry.split(':')
+                if len(parts) == 2:
+                    try:
+                        act = int(parts[0])
+                        v = float(parts[1])
+                        if 0 <= act < 8100 and v > 0:
+                            actions.append(act)
+                            visits.append(v)
+                    except ValueError:
+                        continue
+
+            if visits:
+                total_visits = sum(visits)
+                for act, v in zip(actions, visits):
+                    prob = v / total_visits
+                    from_sq90 = act // 90
+                    to_sq90 = act % 90
+
+                    # Lưu ý: CSV từ Rust đã ở góc nhìn chuẩn của người đi, KHÔNG lật stm == 'b' nữa
+                    # DATA AUGMENTATION: Lật đối xứng Trái - Phải nếu board_tensor đã lật
+                    if is_mirror:
+                        from_sq90 = mirror_sq90_left_right(from_sq90)
+                        to_sq90 = mirror_sq90_left_right(to_sq90)
+
+                    policy_idx = from_sq90 * 90 + to_sq90
+                    target_policy[policy_idx] += prob
+        else:
+            # Định dạng cũ: Nhãn đơn lẻ (One-hot index) để tương thích ngược
+            try:
+                absolute_idx = int(policy_raw)
+            except (ValueError, OverflowError):
+                absolute_idx = -1
+
+            if 0 <= absolute_idx < 8100:
+                from_sq90 = absolute_idx // 90
+                to_sq90 = absolute_idx % 90
+
+                if is_mirror:
+                    from_sq90 = mirror_sq90_left_right(from_sq90)
+                    to_sq90 = mirror_sq90_left_right(to_sq90)
+
+                policy_idx = from_sq90 * 90 + to_sq90
+                target_policy[policy_idx] = 1.0
+
+        # 🛡️ An toàn: Nếu mẫu bị hỏng/rỗng (sum == 0), bốc mẫu ngẫu nhiên khác
+        if target_policy.sum() == 0:
+            import random
+            return self.__getitem__(random.randint(0, len(self) - 1))
 
         value = np.float32(row['value'])
         value = np.clip(value, -1.0, 1.0)
 
-        return board_tensor, np.int64(policy_idx), value
+        return board_tensor, torch.from_numpy(target_policy), value
 
 # =====================================================================
 # 4. MODEL RESNET (8 BLOCKS, 8100 POLICY)
@@ -184,9 +217,9 @@ def train_model():
     batch_size = 1024
     learning_rate = 2e-3  
     
-    epochs = 15
+    epochs = 10
 
-    csv_path = "/kaggle/input/datasets/minhhoang2303/thisisforfun/replay_buffer.csv"
+    csv_path = "/kaggle/input/datasets/huyquang2309/xiangqi-mcts/replay_buffer.csv"
     if not os.path.exists(csv_path):
         print(f"❌ Không tìm thấy file {csv_path}")
         return
@@ -266,7 +299,8 @@ def train_model():
                 val_loss_p += ce_loss_fn(pred_policies, target_policies).item() * boards.size(0)
 
                 _, predicted = torch.max(pred_policies, 1)
-                correct_policy += (predicted == target_policies).sum().item()
+                _, target_top1 = torch.max(target_policies, 1)
+                correct_policy += (predicted == target_top1).sum().item()
                 total_samples += boards.size(0)
 
         avg_val_v = val_loss_v / total_samples

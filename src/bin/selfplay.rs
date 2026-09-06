@@ -19,7 +19,7 @@ use wisdom::tt::TranspositionTable;
 pub struct SelfPlayItem {
     pub fen: String,
     pub value: f32,
-    pub policy: usize,
+    pub policy: String,
 }
 
 // ==========================================================
@@ -77,7 +77,7 @@ fn play_game(
     board.set_initial_position();
     let mut history = Vec::new();
 
-    let mut game_records: Vec<(String, f32, Color, usize)> = Vec::new();
+    let mut game_records: Vec<(String, f32, Color, String)> = Vec::new();
     let mut move_count = 0;
     let winner: Option<Color>;
 
@@ -126,12 +126,24 @@ fn play_game(
 
         let normalized_score = (metrics.win_pct / 50.0) - 1.0;
         let current_side = board.side_to_move;
+        let is_black = current_side == Color::Black;
+
+        let policy_str: String = metrics
+            .all_root_visits
+            .into_iter()
+            .filter(|&(_, visits)| visits > 0)
+            .map(|(mv, visits)| {
+                let idx = Move::move_to_nn_index(mv, is_black);
+                format!("{}:{}", idx, visits)
+            })
+            .collect::<Vec<_>>()
+            .join(";");
 
         game_records.push((
             board.to_fen(),
             normalized_score,
             current_side,
-            Move::move_to_nn_index(best_move, current_side == Color::Black),
+            policy_str,
         ));
 
         let chosen_move = best_move;

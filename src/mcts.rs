@@ -71,6 +71,7 @@ pub struct SearchMetrics {
     pub win_pct: f32,
     pub eval: f32, // Q value in [-1, 1] from the OPPONENT's perspective (negate engine's Q)
     pub top_moves: Vec<(Move, u32, f32)>, // Move, visits, percentage
+    pub all_root_visits: Vec<(Move, u32)>, // Toàn bộ nước đi và số lần duyệt tại Root
 }
 
 impl MCTS {
@@ -312,6 +313,7 @@ impl MCTS {
             win_pct,
             eval,
             top_moves,
+            all_root_visits: children_stats,
         };
 
         (best_move, metrics)

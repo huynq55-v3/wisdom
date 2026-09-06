@@ -74,13 +74,13 @@ class XiangqiDataset(Dataset):
             csv_file,
             header=None,
             names=['fen', 'value', 'policy'],
-            dtype={'fen': str, 'value': np.float32, 'policy': np.int32}
+            dtype={'fen': str, 'value': np.float32, 'policy': str}
         )
-        valid_mask = (self.data['policy'] >= 0) & (self.data['policy'] < 8100)
+        valid_mask = self.data['policy'].notna() & (self.data['policy'].str.len() > 0)
         invalid_count = len(self.data) - valid_mask.sum()
         self.data = self.data[valid_mask].reset_index(drop=True)
         if invalid_count > 0:
-            print(f"Bỏ qua hoàn toàn {invalid_count} vị trí có action index không hợp lệ.")
+            print(f"Bỏ qua hoàn toàn {invalid_count} vị trí có policy không hợp lệ.")
             
         print(f"Đã nạp {len(self.data)} positions hợp lệ.")
 
@@ -90,37 +90,76 @@ class XiangqiDataset(Dataset):
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
         fen = row['fen']
-        stm = fen.split()[1].lower() if len(fen.split()) > 1 else 'w'
-
-        try:
-            absolute_idx = int(row['policy'])
-        except (ValueError, OverflowError):
-            absolute_idx = -1
-
-        if absolute_idx < 0 or absolute_idx >= 8100:
-            import random
-            return self.__getitem__(random.randint(0, len(self) - 1))
+        policy_raw = str(row['policy']).strip()
 
         board_tensor = fen_to_tensor(fen)
-
-        from_sq90 = absolute_idx // 90
-        to_sq90 = absolute_idx % 90
-
-        if stm == 'b':
-            from_sq90 = flip_sq90(from_sq90)
-            to_sq90 = flip_sq90(to_sq90)
-
-        if torch.rand(1).item() < 0.5:
+        is_mirror = torch.rand(1).item() < 0.5
+        if is_mirror:
             board_tensor = torch.flip(board_tensor, dims=[2])
-            from_sq90 = mirror_sq90_left_right(from_sq90)
-            to_sq90 = mirror_sq90_left_right(to_sq90)
 
-        policy_idx = from_sq90 * 90 + to_sq90
+        target_policy = np.zeros(8100, dtype=np.float32)
+
+        if ':' in policy_raw:
+            # Định dạng mới: Phân phối xác suất thưa (act1:visits1;act2:visits2;...)
+            entries = policy_raw.split(';')
+            actions = []
+            visits = []
+            for entry in entries:
+                if not entry:
+                    continue
+                parts = entry.split(':')
+                if len(parts) == 2:
+                    try:
+                        act = int(parts[0])
+                        v = float(parts[1])
+                        if 0 <= act < 8100 and v > 0:
+                            actions.append(act)
+                            visits.append(v)
+                    except ValueError:
+                        continue
+
+            if visits:
+                total_visits = sum(visits)
+                for act, v in zip(actions, visits):
+                    prob = v / total_visits
+                    from_sq90 = act // 90
+                    to_sq90 = act % 90
+
+                    # Lưu ý: CSV từ Rust đã ở góc nhìn chuẩn của người đi, KHÔNG lật stm == 'b' nữa
+                    # DATA AUGMENTATION: Lật đối xứng Trái - Phải nếu board_tensor đã lật
+                    if is_mirror:
+                        from_sq90 = mirror_sq90_left_right(from_sq90)
+                        to_sq90 = mirror_sq90_left_right(to_sq90)
+
+                    policy_idx = from_sq90 * 90 + to_sq90
+                    target_policy[policy_idx] += prob
+        else:
+            # Định dạng cũ: Nhãn đơn lẻ (One-hot index) để tương thích ngược
+            try:
+                absolute_idx = int(policy_raw)
+            except (ValueError, OverflowError):
+                absolute_idx = -1
+
+            if 0 <= absolute_idx < 8100:
+                from_sq90 = absolute_idx // 90
+                to_sq90 = absolute_idx % 90
+
+                if is_mirror:
+                    from_sq90 = mirror_sq90_left_right(from_sq90)
+                    to_sq90 = mirror_sq90_left_right(to_sq90)
+
+                policy_idx = from_sq90 * 90 + to_sq90
+                target_policy[policy_idx] = 1.0
+
+        # 🛡️ An toàn: Nếu mẫu bị hỏng/rỗng (sum == 0), bốc mẫu ngẫu nhiên khác
+        if target_policy.sum() == 0:
+            import random
+            return self.__getitem__(random.randint(0, len(self) - 1))
 
         value = np.float32(row['value'])
         value = np.clip(value, -1.0, 1.0)
 
-        return board_tensor, np.int64(policy_idx), value
+        return board_tensor, torch.from_numpy(target_policy), value
 
 # =====================================================================
 # 4. MODEL RESNET
@@ -273,7 +312,8 @@ def train_model():
                 val_loss_p += ce_loss_fn(pred_policies, target_policies).item() * boards.size(0)
 
                 _, predicted = torch.max(pred_policies, 1)
-                correct_policy += (predicted == target_policies).sum().item()
+                _, target_top1 = torch.max(target_policies, 1)
+                correct_policy += (predicted == target_top1).sum().item()
                 total_samples += boards.size(0)
 
         avg_val_v = val_loss_v / total_samples
@@ -288,28 +328,55 @@ def train_model():
         print(f"Val Value Loss: {avg_val_v:.4f} | Val Policy Loss: {avg_val_p:.4f}")
         print(f"Policy Accuracy (Top-1): {accuracy:.2f}%")
             
-        # 🎯 SỬA LƯU FILE THEO TÊN LATEST CHO LẦN LẶP TIẾP THEO
+        # 🎯 LƯU CHECKPOINT PYTORCH ĐỂ TRAIN TIẾP LẦN SAU
+        checkpoint_dir = "/kaggle/working" if os.path.exists("/kaggle/working") else "."
+        checkpoint_path = os.path.join(checkpoint_dir, "wisdom_net_v1.pth")
         checkpoint = {
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            # Không cần lưu scheduler state vì sang mẻ data mới ta sẽ reset lại vòng Cosine
             'loss': loss,
         }
-
-        # Lưu đè thành file 'latest' để vòng chạy sau trên script tự động nhận lại
-        checkpoint_path = "./wisdom_net_v1.pth"
         torch.save(checkpoint, checkpoint_path)
         print(f"✅ Đã lưu file train tiếp PyTorch: {checkpoint_path}")
 
-        # Lưu file safetensors (xuất ra để mang sang Rust chạy)
+        # 🎯 XUẤT SAFETENSORS
+        safetensors_path = os.path.join(checkpoint_dir, "wisdom_net_latest.safetensors")
         state_dict_cpu = {k: v.cpu().contiguous() for k, v in model.state_dict().items()}
-        safetensors_path = f"./wisdom_net_latest.safetensors"
         save_file(state_dict_cpu, safetensors_path)
-        print(f"✅ Đã xuất safetensors (cho Rust): {safetensors_path}")
+        print(f"✅ Đã xuất safetensors: {safetensors_path}")
 
+        # 🚀 XUẤT FILE ONNX CHO RUST / OPENVINO (wisdom_net_v1.onnx)
+        onnx_path = os.path.join(checkpoint_dir, "wisdom_net_v1.onnx")
+        print(f"📦 Đang chuyển đổi và xuất ONNX sang: {onnx_path}...")
+        model.eval()
+        dummy_input = torch.randn(1, 14, 10, 9, dtype=torch.float32).to(device)
+        torch.onnx.export(
+            model,
+            dummy_input,
+            onnx_path,
+            export_params=True,
+            opset_version=18,
+            do_constant_folding=True,
+            input_names=['input'],
+            output_names=['value', 'policy'],
+            dynamic_axes={
+                'input': {0: 'batch_size'},
+                'value': {0: 'batch_size'},
+                'policy': {0: 'batch_size'}
+            }
+        )
+        print(f"🎉 Xuất ONNX thành công: {onnx_path}")
         print(f"{'='*60}\n")
 
-    print("🎉 Hoàn tất 1 Iteration. Đã sẵn sàng Data sinh từ Rust cho Iteration kế tiếp!")
+    # In danh sách file trong working dir để kiểm tra
+    print("📁 Danh sách file đầu ra hiện có:")
+    out_dir = "/kaggle/working" if os.path.exists("/kaggle/working") else "."
+    for f in os.listdir(out_dir):
+        if f.startswith("wisdom_net"):
+            sz = os.path.getsize(os.path.join(out_dir, f)) / (1024 * 1024)
+            print(f"   ↳ {f} ({sz:.2f} MB)")
+
+    print("\n🎉 Hoàn tất 1 Iteration! File ONNX đã sẵn sàng để nạp vào Rust.")
 
 if __name__ == "__main__":
     train_model()
