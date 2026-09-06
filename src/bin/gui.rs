@@ -1,7 +1,15 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread;
+
 use macroquad::prelude::*;
+use wisdom::ab_tt::TranspositionTableAB;
 use wisdom::board::{Board, Color as PieceColor, HistoryEntry, PieceType, RepetitionResult};
+use wisdom::nnue::NNUEModel;
 use wisdom::r#move::Move;
-use wisdom::ucci::parse_ucci_move;
+use wisdom::search::{search_best_move_with_callback, SearchProgress};
+use wisdom::ucci::{move_to_ucci_string, parse_ucci_move};
 
 const SQUARE_SIZE: f32 = 60.0;
 const OFFSET_X: f32 = 50.0;
@@ -14,10 +22,38 @@ enum GameMode {
     EngineVsEngine,
 }
 
+fn find_model_path() -> std::path::PathBuf {
+    let candidates = [
+        std::path::PathBuf::from("./wisdom_models/wisdom_nnue.bin"),
+        std::path::PathBuf::from("wisdom_models/wisdom_nnue.bin"),
+        std::path::PathBuf::from("./wisdom_nnue.bin"),
+        std::path::PathBuf::from("/home/huy/Documents/wisdom/wisdom_models/wisdom_nnue.bin"),
+    ];
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p1 = dir.join("wisdom_models").join("wisdom_nnue.bin");
+            if p1.exists() {
+                return p1;
+            }
+            let p2 = dir.join("wisdom_nnue.bin");
+            if p2.exists() {
+                return p2;
+            }
+        }
+    }
+
+    for p in &candidates {
+        if p.exists() {
+            return p.clone();
+        }
+    }
+
+    candidates[0].clone()
+}
+
 fn get_legal_moves(board: &mut Board) -> Vec<Move> {
-    let mut moves = board.generate_captures();
-    let mut quiets = board.generate_quiets();
-    moves.append(&mut quiets);
+    let moves = board.generate_all_moves();
     let moving_side = board.side_to_move;
 
     moves
@@ -68,17 +104,7 @@ fn apply_move_to_game(board: &mut Board, m: Move, history: &mut Vec<HistoryEntry
 }
 
 fn format_move(m: Move) -> String {
-    let (from_row, from_col) = Board::square_to_coord(m.from_sq());
-    let (to_row, to_col) = Board::square_to_coord(m.to_sq());
-
-    // Convert to UCCI format. Files a-i, Ranks 0-9 (from bottom to top).
-    // Our row 9 is bottom, so UCCI rank is 9 - row.
-    let from_file = (b'a' + from_col as u8) as char;
-    let from_rank = (b'0' + (9 - from_row) as u8) as char;
-    let to_file = (b'a' + to_col as u8) as char;
-    let to_rank = (b'0' + (9 - to_row) as u8) as char;
-
-    format!("{}{}{}{}", from_file, from_rank, to_file, to_rank)
+    move_to_ucci_string(m)
 }
 
 fn draw_board() {
@@ -376,11 +402,26 @@ fn replay_moves_from_startpos(
 
 fn window_conf() -> Conf {
     Conf {
-        window_title: "Wisdom Engine - Xiangqi (MCTS)".to_owned(),
+        window_title: "Wisdom Engine - Xiangqi (NNUE Alpha-Beta)".to_owned(),
         window_width: 900,
         window_height: 700,
         ..Default::default()
     }
+}
+
+enum EngineCommand {
+    StartSearch {
+        board: Board,
+        history: Vec<HistoryEntry>,
+        depth: usize,
+    },
+    Stop,
+}
+
+enum EngineMessage {
+    Progress(SearchProgress),
+    BestMove(Move),
+    NoMove,
 }
 
 #[macroquad::main(window_conf)]
@@ -414,105 +455,69 @@ async fn main() {
     // UI State
     let mut game_mode = GameMode::EngineVsPlayer;
     let mut human_color = PieceColor::Red;
-    let mut mcts_simulations: usize = 2000;
+    let mut search_depth: usize = 12;
     let mut current_eval: Option<String> = Some("Ready".to_string());
-    let mut engine_policy: Vec<String> = Vec::new();
-    let mut current_eval_score: Option<f32> = None; // MCTS eval in [-1, 1] from player's perspective
+    let mut current_stats: Option<String> = None;
+    let mut engine_pv: Vec<String> = Vec::new();
+    let mut current_eval_score: Option<f32> = None; // Advantage in [-1, 1] from player's perspective
 
-    // ENGINE SUBPROCESS
-    use std::io::{BufRead, BufReader, Write};
-    use std::process::{Command, Stdio};
-    use std::sync::mpsc;
-    use std::thread;
+    // Find and load Wisdom NNUE model
+    let model_path = find_model_path();
+    println!("GUI: Loading Wisdom NNUE model from {:?}...", model_path);
+    let model = match NNUEModel::load_from_file(&model_path) {
+        Ok(m) => Arc::new(m),
+        Err(e) => {
+            eprintln!("GUI Error: Failed to load NNUE model from {:?}: {}", model_path, e);
+            panic!("Cannot start GUI without NNUE model: {}", e);
+        }
+    };
+    println!("GUI: Successfully loaded Wisdom NNUE model! ⚡️🚀");
 
-    println!("GUI: Spawning Wisdom Engine Subprocess...");
-    let mut engine_process = Command::new("./wisdom")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("Failed to start engine process. Make sure to run from project root.");
+    // Spawn Background Worker Thread for Search
+    let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>();
+    let (resp_tx, resp_rx) = mpsc::channel::<EngineMessage>();
+    let stop_signal = Arc::new(AtomicBool::new(false));
 
-    let mut engine_stdin = engine_process.stdin.take().expect("Failed to open stdin");
-    let stdout = engine_process.stdout.take().expect("Failed to open stdout");
-
-    // UCCI Protocol Message
-    enum EngineMessage {
-        Info {
-            text: String,
-            policy: Vec<String>,
-            eval: Option<f32>,
-        },
-        BestMove(String),
-    }
-
-    let (tx, rx) = mpsc::channel();
+    let thread_model = model.clone();
+    let thread_stop = stop_signal.clone();
 
     thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                if line.starts_with("info") {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    let mut nodes = "";
-                    let mut winpct = "";
-                    let mut eval_val: Option<f32> = None;
-                    let mut pv = Vec::new();
+        let mut tt = TranspositionTableAB::new(64); // 64 MB TT table
 
-                    let mut i = 1;
-                    while i < parts.len() {
-                        if parts[i] == "nodes" && i + 1 < parts.len() {
-                            nodes = parts[i + 1];
-                            i += 2;
-                        } else if parts[i] == "winpct" && i + 1 < parts.len() {
-                            winpct = parts[i + 1];
-                            i += 2;
-                        } else if parts[i] == "eval" && i + 1 < parts.len() {
-                            eval_val = parts[i + 1].parse::<f32>().ok();
-                            i += 2;
-                        } else if parts[i] == "pv" {
-                            for j in (i + 1)..parts.len().min(i + 6) {
-                                pv.push(format!("{}. {}", j - i, parts[j]));
-                            }
-                            break;
-                        } else {
-                            i += 1;
-                        }
-                    }
+        while let Ok(cmd) = cmd_rx.recv() {
+            match cmd {
+                EngineCommand::StartSearch { mut board, history, depth } => {
+                    thread_stop.store(false, Ordering::Relaxed);
+                    let tx_clone = resp_tx.clone();
+                    let sig = thread_stop.clone();
 
-                    let summary = format!("N:{} W:{}%", nodes, winpct);
-                    let msg = EngineMessage::Info {
-                        text: summary,
-                        policy: pv,
-                        eval: eval_val,
-                    };
-                    tx.send(msg).unwrap_or(());
-                } else if line.starts_with("bestmove") {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() > 1 {
-                        tx.send(EngineMessage::BestMove(parts[1].to_string()))
-                            .unwrap_or(());
+                    let res = search_best_move_with_callback(
+                        &mut board,
+                        &history,
+                        depth,
+                        None,
+                        &thread_model,
+                        &mut tt,
+                        Some(sig),
+                        |prog| {
+                            tx_clone.send(EngineMessage::Progress(prog.clone())).unwrap_or(());
+                        },
+                    );
+
+                    if let Some(m) = res.best_move {
+                        resp_tx.send(EngineMessage::BestMove(m)).unwrap_or(());
+                    } else {
+                        resp_tx.send(EngineMessage::NoMove).unwrap_or(());
                     }
+                }
+                EngineCommand::Stop => {
+                    thread_stop.store(true, Ordering::Relaxed);
                 }
             }
         }
     });
 
-    // Send ucci to initialize
-    writeln!(engine_stdin, "ucci").unwrap();
-    writeln!(engine_stdin, "isready").unwrap();
-
     let mut is_engine_thinking = false;
-
-    let send_position_and_go =
-        |moves: &[String], simulations: usize, stdin: &mut std::process::ChildStdin| {
-            let mut cmd = "position startpos".to_string();
-            if !moves.is_empty() {
-                cmd.push_str(" moves ");
-                cmd.push_str(&moves.join(" "));
-            }
-            writeln!(stdin, "{}", cmd).unwrap();
-            writeln!(stdin, "go simulations {}", simulations).unwrap();
-        };
 
     loop {
         draw_board();
@@ -528,11 +533,16 @@ async fn main() {
         let panel_x = 620.0;
         let mut py = OFFSET_Y;
 
-        draw_text("Wisdom UCCI GUI", panel_x, py, 30.0, BLACK);
+        draw_text("Wisdom NNUE GUI", panel_x, py, 28.0, BLACK);
         py += 40.0;
 
         // Reset Button
-        if !is_engine_thinking && draw_button("Reset Game", panel_x, py, 95.0, 40.0, false, BLUE) {
+        if draw_button("Reset Game", panel_x, py, 95.0, 40.0, false, BLUE) {
+            if is_engine_thinking {
+                stop_signal.store(true, Ordering::Relaxed);
+                cmd_tx.send(EngineCommand::Stop).unwrap_or(());
+                is_engine_thinking = false;
+            }
             board.set_initial_position();
             game_history.clear();
             game_moves_uci.clear();
@@ -541,8 +551,9 @@ async fn main() {
             game_over = false;
             game_over_message = "GAME OVER".into();
             current_eval = Some("Ready".to_string());
+            current_stats = None;
             current_eval_score = None;
-            engine_policy.clear();
+            engine_pv.clear();
         }
 
         // Undo Button (only in Player vs Engine mode)
@@ -552,26 +563,26 @@ async fn main() {
             && !game_over;
         let undo_color = if can_undo { ORANGE } else { LIGHTGRAY };
         if can_undo && draw_button("Undo", panel_x + 105.0, py, 95.0, 40.0, false, undo_color) {
-            // Pop last 2 moves (engine + player)
             game_moves_uci.pop();
             game_moves_uci.pop();
             replay_moves_from_startpos(&mut board, &mut game_history, &game_moves_uci);
             selected_sq = None;
             legal_moves.clear();
             current_eval = Some("Move undone".to_string());
+            current_stats = None;
             current_eval_score = None;
-            engine_policy.clear();
+            engine_pv.clear();
         } else if !can_undo {
             draw_button("Undo", panel_x + 105.0, py, 95.0, 40.0, false, LIGHTGRAY);
         }
-        py += 60.0;
+        py += 55.0;
 
         // Game Mode Toggle
         draw_text("Game Mode:", panel_x, py, 20.0, BLACK);
         py += 25.0;
         if !is_engine_thinking
             && draw_button(
-                "Engine vs Player",
+                "Player vs Engine",
                 panel_x,
                 py,
                 180.0,
@@ -589,10 +600,11 @@ async fn main() {
             game_over = false;
             game_over_message = "GAME OVER".into();
             current_eval = Some("Ready".to_string());
+            current_stats = None;
             current_eval_score = None;
-            engine_policy.clear();
+            engine_pv.clear();
         }
-        py += 40.0;
+        py += 38.0;
         if !is_engine_thinking
             && draw_button(
                 "Engine vs Engine",
@@ -613,10 +625,11 @@ async fn main() {
             game_over = false;
             game_over_message = "GAME OVER".into();
             current_eval = Some("Ready".to_string());
+            current_stats = None;
             current_eval_score = None;
-            engine_policy.clear();
+            engine_pv.clear();
         }
-        py += 40.0;
+        py += 38.0;
 
         // Side Selection
         if game_mode == GameMode::EngineVsPlayer {
@@ -642,7 +655,9 @@ async fn main() {
                 game_over = false;
                 game_over_message = "GAME OVER".into();
                 current_eval = Some("Ready".to_string());
+                current_stats = None;
                 current_eval_score = None;
+                engine_pv.clear();
             }
             if !is_engine_thinking
                 && draw_button(
@@ -664,52 +679,61 @@ async fn main() {
                 game_over = false;
                 game_over_message = "GAME OVER".into();
                 current_eval = Some("Ready".to_string());
+                current_stats = None;
                 current_eval_score = None;
+                engine_pv.clear();
             }
-            py += 40.0;
+            py += 38.0;
         }
 
-        // MCTS Simulations Control
+        // Search Depth Control
         draw_text(
-            &format!("Simulations: {}", mcts_simulations),
+            &format!("Search Depth: {} plies", search_depth),
             panel_x,
             py,
-            20.0,
+            18.0,
             BLACK,
         );
-        py += 25.0;
-        if !is_engine_thinking && draw_button("-", panel_x, py, 40.0, 30.0, false, GRAY) {
-            if mcts_simulations > 100 {
-                mcts_simulations -= 100;
+        py += 22.0;
+        if !is_engine_thinking && draw_button("-", panel_x, py, 40.0, 28.0, false, GRAY) {
+            if search_depth > 4 {
+                search_depth -= 1;
             }
         }
-        if !is_engine_thinking && draw_button("+", panel_x + 50.0, py, 40.0, 30.0, false, GRAY) {
-            if mcts_simulations < 5000 {
-                mcts_simulations += 100;
+        if !is_engine_thinking && draw_button("+", panel_x + 50.0, py, 40.0, 28.0, false, GRAY) {
+            if search_depth < 25 {
+                search_depth += 1;
             }
         }
-        py += 50.0;
+        py += 40.0;
 
-        // Eval Bar Display
+        // Advantage Bar Display
         if let Some(eval_score) = current_eval_score {
-            draw_text("Player Eval:", panel_x, py, 20.0, BLACK);
-            py += 25.0;
-            draw_eval_bar(eval_score, panel_x, py, 160.0, 20.0);
-            py += 35.0;
+            draw_text("Advantage:", panel_x, py, 18.0, BLACK);
+            py += 22.0;
+            draw_eval_bar(eval_score, panel_x, py, 180.0, 18.0);
+            py += 28.0;
         }
 
         // Eval Text Display
         if let Some(ref eval_str) = current_eval {
-            draw_text(eval_str, panel_x, py, 22.0, DARKGREEN);
-            py += 30.0;
+            draw_text(eval_str, panel_x, py, 18.0, DARKGREEN);
+            py += 22.0;
         }
 
-        if !engine_policy.is_empty() {
-            draw_text("Top Moves:", panel_x, py, 20.0, BLACK);
-            py += 25.0;
-            for line in &engine_policy {
-                draw_text(line, panel_x, py, 18.0, DARKGRAY);
-                py += 20.0;
+        // Stats Display (Nodes, NPS)
+        if let Some(ref stats_str) = current_stats {
+            draw_text(stats_str, panel_x, py, 15.0, Color::new(0.1, 0.3, 0.7, 1.0));
+            py += 22.0;
+        }
+
+        // Predicted Line (PV)
+        if !engine_pv.is_empty() {
+            draw_text("Predicted Line (PV):", panel_x, py, 17.0, BLACK);
+            py += 20.0;
+            for line in &engine_pv {
+                draw_text(line, panel_x, py, 15.0, DARKGRAY);
+                py += 17.0;
             }
         }
 
@@ -718,56 +742,69 @@ async fn main() {
         }
 
         // Non-blocking wait for Engine reply
-        while let Ok(msg) = rx.try_recv() {
+        while let Ok(msg) = resp_rx.try_recv() {
             match msg {
-                EngineMessage::Info { text, policy, eval } => {
-                    current_eval = Some(text);
-                    if !policy.is_empty() {
-                        engine_policy = policy;
-                    }
-                    if let Some(e) = eval {
-                        current_eval_score = Some(e);
+                EngineMessage::Progress(prog) => {
+                    let player_score = if human_color == PieceColor::Red {
+                        prog.score
+                    } else {
+                        -prog.score
+                    };
+                    let norm = (player_score as f32 / 400.0).clamp(-1.0, 1.0);
+                    current_eval_score = Some(norm);
+
+                    current_eval = Some(format!("Depth: {} | Score: {:+4} cp", prog.depth, prog.score));
+                    current_stats = Some(format!("{} nodes | {} NPS", prog.nodes, prog.nps));
+
+                    engine_pv.clear();
+                    let moves: Vec<&str> = prog.pv.split_whitespace().collect();
+                    for (i, m) in moves.iter().take(5).enumerate() {
+                        engine_pv.push(format!("{}. {}", i + 1, m));
                     }
                 }
-                EngineMessage::BestMove(move_str) => {
-                    if let Some(m) = wisdom::ucci::parse_ucci_move(&board, &move_str) {
-                        apply_move_to_game(&mut board, m, &mut game_history);
-                        game_moves_uci.push(format_move(m));
+                EngineMessage::BestMove(m) => {
+                    apply_move_to_game(&mut board, m, &mut game_history);
+                    game_moves_uci.push(format_move(m));
 
-                        // GUI Repetition check after Engine plays
-                        if game_history.len() >= 4 {
-                            match board.judge_repetition(&game_history, game_history.len(), 2) {
-                                RepetitionResult::Win => {
-                                    game_over = true;
-                                    game_over_message = "Engine Violation: You Win!".into();
-                                    current_eval = Some("WON".to_string());
-                                }
-                                RepetitionResult::Loss => {
-                                    game_over = true;
-                                    game_over_message = "Rule Violation: Engine Wins!".into();
-                                    current_eval = Some("LOST".to_string());
-                                }
-                                RepetitionResult::Draw => {
-                                    game_over = true;
-                                    game_over_message = "Draw by Repetition!".into();
-                                    current_eval = Some("DRAW".to_string());
-                                }
-                                RepetitionResult::Undecided => {
-                                    if get_legal_moves(&mut board).is_empty() {
-                                        game_over = true;
-                                        game_over_message = "Checkmate!".into();
-                                        current_eval = Some("CHECKMATE".to_string());
-                                    }
-                                }
-                            }
-                        } else {
-                            if get_legal_moves(&mut board).is_empty() {
+                    // GUI Repetition check after Engine plays
+                    if game_history.len() >= 4 {
+                        match board.judge_repetition(&game_history, game_history.len(), 2) {
+                            RepetitionResult::Win => {
                                 game_over = true;
-                                game_over_message = "Checkmate!".into();
-                                current_eval = Some("CHECKMATE".to_string());
+                                game_over_message = "Engine Violation: You Win!".into();
+                                current_eval = Some("WON".to_string());
+                            }
+                            RepetitionResult::Loss => {
+                                game_over = true;
+                                game_over_message = "Rule Violation: Engine Wins!".into();
+                                current_eval = Some("LOST".to_string());
+                            }
+                            RepetitionResult::Draw => {
+                                game_over = true;
+                                game_over_message = "Draw by Repetition!".into();
+                                current_eval = Some("DRAW".to_string());
+                            }
+                            RepetitionResult::Undecided => {
+                                if get_legal_moves(&mut board).is_empty() {
+                                    game_over = true;
+                                    game_over_message = "Checkmate!".into();
+                                    current_eval = Some("CHECKMATE".to_string());
+                                }
                             }
                         }
+                    } else {
+                        if get_legal_moves(&mut board).is_empty() {
+                            game_over = true;
+                            game_over_message = "Checkmate!".into();
+                            current_eval = Some("CHECKMATE".to_string());
+                        }
                     }
+                    is_engine_thinking = false;
+                }
+                EngineMessage::NoMove => {
+                    game_over = true;
+                    game_over_message = "Checkmate / Stalemate!".into();
+                    current_eval = Some("CHECKMATE".to_string());
                     is_engine_thinking = false;
                 }
             }
@@ -836,7 +873,7 @@ async fn main() {
                                                 current_eval = Some("CHECKMATE".to_string());
                                             } else {
                                                 current_eval =
-                                                    Some("Engine Thinking...".to_string());
+                                                    Some("Wisdom NNUE Thinking...".to_string());
                                             }
                                         }
                                     }
@@ -847,7 +884,7 @@ async fn main() {
                                         game_over_message = "Checkmate!".into();
                                         current_eval = Some("CHECKMATE".to_string());
                                     } else {
-                                        current_eval = Some("Engine Thinking...".to_string());
+                                        current_eval = Some("Wisdom NNUE Thinking...".to_string());
                                     }
                                 }
                             } else {
@@ -881,16 +918,20 @@ async fn main() {
                     }
                 }
             } else {
-                // ENGINE TURN: Trigger Go command
+                // ENGINE TURN: Trigger Search command
                 let all_moves = get_legal_moves(&mut board);
                 if all_moves.is_empty() {
                     game_over = true;
                     game_over_message = "Checkmate!".into();
                     current_eval = Some("CHECKMATE".to_string());
                 } else {
-                    current_eval = Some("Engine Thinking...".to_string());
+                    current_eval = Some("Wisdom NNUE Thinking...".to_string());
                     is_engine_thinking = true;
-                    send_position_and_go(&game_moves_uci, mcts_simulations, &mut engine_stdin);
+                    cmd_tx.send(EngineCommand::StartSearch {
+                        board: board.clone(),
+                        history: game_history.clone(),
+                        depth: search_depth,
+                    }).unwrap_or(());
                 }
             }
         }

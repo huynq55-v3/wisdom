@@ -1,10 +1,11 @@
+pub mod ab_tt;
+pub mod bin_format;
 pub mod board;
-pub mod eval_queue;
-pub mod mcts;
 pub mod r#move;
 pub mod movegen;
-pub mod nn;
+pub mod nnue;
 pub mod perft;
-pub mod tt;
+pub mod search;
 pub mod ucci;
 pub mod zobrist;
+

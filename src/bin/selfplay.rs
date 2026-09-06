@@ -1,296 +1,402 @@
-use crossbeam_channel::Sender;
-use std::env;
-use std::fs;
-use std::io::{BufWriter, Write};
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Instant;
 
-use wisdom::board::{Board, Color, HistoryEntry, PieceType};
-use wisdom::eval_queue::{EvalQueue, EvalRequest};
-use wisdom::mcts::MCTS;
-use wisdom::r#move::Move;
-use wisdom::nn::XiangqiOnnx;
-use wisdom::tt::TranspositionTable;
+use rand::rng;
+use rand::seq::IndexedRandom;
+use wisdom::ab_tt::TranspositionTableAB;
+use wisdom::bin_format::{WisdomBinRecord, RECORD_SIZE};
+use wisdom::board::{Board, Color, HistoryEntry, RepetitionResult};
+use wisdom::nnue::NNUEModel;
+use wisdom::search::search_top_moves;
+use wisdom::ucci::apply_move_with_history;
 
-// ==========================================================
-// CẤU TRÚC LƯU TRỮ
-// ==========================================================
-#[derive(Clone, Debug)]
-pub struct SelfPlayItem {
-    pub fen: String,
-    pub value: f32,
-    pub policy: String,
+struct SelfplayConfig {
+    num_games: usize,
+    num_threads: usize,
+    search_depth: usize,
+    random_top_n: usize,
+    max_game_plies: usize,
+    max_buffer_size: usize,
+    output_path: PathBuf,
+    model_path: PathBuf,
 }
 
-// ==========================================================
-// HÀM TRỢ GIÚP TÌM MODEL MỚI NHẤT
-// ==========================================================
-fn get_latest_model_version(model_dir: &str) -> usize {
-    let mut latest_version = 0;
+impl Default for SelfplayConfig {
+    fn default() -> Self {
+        Self {
+            num_games: 50,
+            num_threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+            search_depth: 7,
+            random_top_n: 3, // Mặc định chọn ngẫu nhiên trong Top 3 nước điểm cao nhất
+            max_game_plies: 220,
+            max_buffer_size: 1_000_000, // 1 triệu positions (~96 MB) chuẩn FIFO
+            output_path: PathBuf::from("wisdom_data/replay_buffer.bin"),
+            model_path: PathBuf::from("wisdom_models/wisdom_nnue.bin"),
+        }
+    }
+}
 
-    if let Ok(entries) = fs::read_dir(model_dir) {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name().into_string().unwrap_or_default();
-            // Lọc các file có dạng: wisdom_net_vX.onnx
-            if file_name.starts_with("wisdom_net_v") && file_name.ends_with(".onnx") {
-                if let Some(v_str) = file_name
-                    .strip_prefix("wisdom_net_v")
-                    .and_then(|s| s.strip_suffix(".onnx"))
-                {
-                    if let Ok(v) = v_str.parse::<usize>() {
-                        if v > latest_version {
-                            latest_version = v;
-                        }
-                    }
+fn parse_args() -> SelfplayConfig {
+    let mut config = SelfplayConfig::default();
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--games" | "-g" => {
+                if i + 1 < args.len() {
+                    config.num_games = args[i + 1].parse().unwrap_or(config.num_games);
+                    i += 1;
                 }
             }
-        }
-    }
-    latest_version
-}
-
-// ==========================================================
-// LOGIC CHƠI 1 GAME (CHỈ LẤY FEN)
-// ==========================================================
-fn get_all_legal_moves(board: &mut Board) -> Vec<Move> {
-    let mut all_moves = board.generate_captures();
-    all_moves.append(&mut board.generate_quiets());
-    let mut legal_moves = Vec::new();
-    let moving_side = board.side_to_move;
-
-    for m in all_moves {
-        let undo = board.make_move(m);
-        let legal = !board.kings_facing() && !board.is_in_check(moving_side);
-        board.unmake_move(m, undo);
-        if legal {
-            legal_moves.push(m);
-        }
-    }
-    legal_moves
-}
-
-fn play_game(
-    eval_tx: &Sender<EvalRequest>,
-    shared_tt: &Arc<TranspositionTable>,
-) -> Vec<SelfPlayItem> {
-    let mut board = Board::new();
-    board.set_initial_position();
-    let mut history = Vec::new();
-
-    let mut game_records: Vec<(String, f32, Color, String)> = Vec::new();
-    let mut move_count = 0;
-    let winner: Option<Color>;
-
-    let simulations = 800;
-    let mcts = MCTS::new(500_000);
-
-    loop {
-        let legal_moves = get_all_legal_moves(&mut board);
-        if legal_moves.is_empty() {
-            winner = if board.is_in_check(board.side_to_move) {
-                Some(board.side_to_move.opposite())
-            } else {
-                None
-            };
-            break;
-        }
-
-        if move_count > 400 {
-            winner = None;
-            break;
-        }
-
-        let rep = board.judge_repetition(&history, history.len(), 1);
-        match rep {
-            wisdom::board::RepetitionResult::Draw => {
-                winner = None;
-                break;
+            "--threads" | "-t" => {
+                if i + 1 < args.len() {
+                    config.num_threads = args[i + 1].parse().unwrap_or(config.num_threads);
+                    i += 1;
+                }
             }
-            wisdom::board::RepetitionResult::Loss => {
-                winner = Some(board.side_to_move.opposite());
-                break;
+            "--depth" | "-d" => {
+                if i + 1 < args.len() {
+                    config.search_depth = args[i + 1].parse().unwrap_or(config.search_depth);
+                    i += 1;
+                }
             }
-            wisdom::board::RepetitionResult::Win => {
-                winner = Some(board.side_to_move);
-                break;
+            "--random-plies" | "-r" | "--random-top" | "--top-moves" => {
+                if i + 1 < args.len() {
+                    config.random_top_n = args[i + 1].parse().unwrap_or(config.random_top_n);
+                    i += 1;
+                }
+            }
+            "--buffer-size" | "--max-buffer" => {
+                if i + 1 < args.len() {
+                    config.max_buffer_size = args[i + 1].parse().unwrap_or(config.max_buffer_size);
+                    i += 1;
+                }
+            }
+            "--output" | "-o" => {
+                if i + 1 < args.len() {
+                    config.output_path = PathBuf::from(&args[i + 1]);
+                    i += 1;
+                }
+            }
+            "--model" | "-m" => {
+                if i + 1 < args.len() {
+                    config.model_path = PathBuf::from(&args[i + 1]);
+                    i += 1;
+                }
             }
             _ => {}
         }
-
-        let (best_move, metrics) =
-            mcts.search_best_move(&board, &history, simulations, eval_tx, shared_tt, 1, true);
-
-        // In dấu chấm để báo hiệu game đang chạy mượt
-        print!(".");
-        let _ = std::io::stdout().flush();
-
-        let normalized_score = (metrics.win_pct / 50.0) - 1.0;
-        let current_side = board.side_to_move;
-        let is_black = current_side == Color::Black;
-
-        let policy_str: String = metrics
-            .all_root_visits
-            .into_iter()
-            .filter(|&(_, visits)| visits > 0)
-            .map(|(mv, visits)| {
-                let idx = Move::move_to_nn_index(mv, is_black);
-                format!("{}:{}", idx, visits)
-            })
-            .collect::<Vec<_>>()
-            .join(";");
-
-        game_records.push((
-            board.to_fen(),
-            normalized_score,
-            current_side,
-            policy_str,
-        ));
-
-        let chosen_move = best_move;
-        let is_capture = board.piece_at(chosen_move.to_sq()).is_some();
-        let piece = board.piece_at(chosen_move.from_sq()).unwrap();
-        let is_reversible = !is_capture
-            && (piece.piece_type != PieceType::Pawn || {
-                let (from_row, _) = Board::square_to_coord(chosen_move.from_sq());
-                let (to_row, _) = Board::square_to_coord(chosen_move.to_sq());
-                from_row == to_row
-            });
-
-        let pre_threats = if is_reversible {
-            board.get_unprotected_threats(current_side)
-        } else {
-            0
-        };
-        board.make_move(chosen_move);
-        let gives_check = board.is_in_check(board.side_to_move);
-        let chased_set = if is_reversible && !gives_check {
-            let post_threats = board.get_unprotected_threats(current_side);
-            post_threats & !pre_threats
-        } else {
-            0
-        };
-
-        history.push(HistoryEntry {
-            hash: board.zobrist_key,
-            is_check: gives_check,
-            chased_set,
-            is_reversible,
-        });
-
-        move_count += 1;
+        i += 1;
     }
-
-    // 🎯 ÁP DỤNG CÔNG THỨC ALPHA = 0.8
-    let alpha = 0.0;
-    match winner {
-        None => game_records
-            .into_iter()
-            .map(|(fen, search_val, _, policy)| SelfPlayItem {
-                fen,
-                value: search_val * alpha, // Game hòa z = 0
-                policy,
-            })
-            .collect(),
-        Some(winning_color) => game_records
-            .into_iter()
-            .map(|(fen, search_val, side, policy)| {
-                let z = if side == winning_color { 1.0 } else { -1.0 };
-                SelfPlayItem {
-                    fen,
-                    value: search_val * alpha + z * (1.0 - alpha),
-                    policy,
-                }
-            })
-            .collect(),
-    }
+    config
 }
 
-// ==========================================================
-// HÀM MAIN - QUẢN LÝ LUỒNG & BATCHING
-// ==========================================================
-fn main() {
-    // 1. Nhận tham số số vòng (rounds) từ Command Line
-    let args: Vec<String> = env::args().collect();
-    let rounds: usize = if args.len() > 1 {
-        args[1]
-            .parse()
-            .expect("Vui lòng nhập một số nguyên cho số vòng (VD: cargo run --bin selfplay 10)")
-    } else {
-        1 // Mặc định chạy 1 vòng
-    };
+struct PendingRecord {
+    board: Board,
+    score: i16,
+    ply: u16,
+    stm: Color,
+}
 
-    let model_dir = "./wisdom_models";
-    fs::create_dir_all(model_dir).expect("Không thể tạo thư mục models");
+fn play_one_game(
+    model: &NNUEModel,
+    tt: &mut TranspositionTableAB,
+    depth: usize,
+    random_top_n: usize,
+    max_plies: usize,
+) -> (Vec<WisdomBinRecord>, &'static str) {
+    let mut board = Board::new();
+    board.set_initial_position();
+    let mut history: Vec<HistoryEntry> = Vec::new();
+    let mut pending: Vec<PendingRecord> = Vec::new();
+    let mut ply: usize = 0;
 
-    // 2. Tự động quét và Load model mới nhất
-    let version = get_latest_model_version(model_dir);
-    let model_path = format!("{}/wisdom_net_v{}.onnx", model_dir, version);
+    let mut local_rng = rng();
 
-    println!("============================================================");
-    println!("🚀 KHỞI ĐỘNG HỆ THỐNG SELF-PLAY");
-    println!("📦 Model đang dùng : {}", model_path);
-    println!(
-        "🔄 Số vòng         : {} (Tổng {} games)",
-        rounds,
-        rounds * 512
-    );
-    println!("⚙️ Batch Size      : 512 | Timeout: 100 µs");
-    println!("============================================================\n");
+    let reason: &'static str;
+    let final_outcome_red: i8; // 1 = Red win, 0 = Draw, -1 = Black win
 
-    // Tải mô hình OpenVINO / ONNX
-    let onnx_model = XiangqiOnnx::new(&model_path);
-
-    let eval_queue = EvalQueue::new(onnx_model, 512, 100);
-    let all_generated_data = Arc::new(Mutex::new(Vec::new()));
-    let shared_tt = Arc::new(TranspositionTable::new(16384));
-
-    let start_time = Instant::now();
-
-    for round in 1..=rounds {
-        println!("\n▶️ Bắt đầu Vòng {}/{}...", round, rounds);
-
-        // 4. Khởi tạo chính xác 128 luồng bằng std::thread::scope
-        std::thread::scope(|s| {
-            for _ in 0..512 {
-                let tx = &eval_queue.tx;
-                let data_clone = Arc::clone(&all_generated_data);
-                let tt_clone = Arc::clone(&shared_tt);
-
-                s.spawn(move || {
-                    let records = play_game(tx, &tt_clone);
-                    data_clone.lock().unwrap().extend(records);
-                });
-            }
-        });
-
-        println!("\n✅ Hoàn thành Vòng {}.", round);
-    }
-
-    // 5. Lưu toàn bộ kết quả vào 1 file duy nhất trong thư mục v{version}
-    let data_snapshot = all_generated_data.lock().unwrap();
-    if !data_snapshot.is_empty() {
-        let output_dir = format!("{}/v{}", model_dir, version);
-        fs::create_dir_all(&output_dir).unwrap();
-
-        let file_path = format!(
-            "{}/selfplay_data_{}.csv",
-            output_dir,
-            std::time::UNIX_EPOCH.elapsed().unwrap().as_secs()
-        );
-        let file = fs::File::create(&file_path).expect("Không thể tạo file data");
-        let mut writer = BufWriter::new(file);
-
-        for item in data_snapshot.iter() {
-            writeln!(writer, "{},{},{}", item.fen, item.value, item.policy).unwrap();
+    loop {
+        if ply >= max_plies {
+            reason = "Max plies reached";
+            final_outcome_red = 0;
+            break;
         }
 
-        println!(
-            "\n🎉 XONG! Đã sinh thành công {} FENs.",
-            data_snapshot.len()
-        );
-        println!("💾 Dữ liệu được lưu tại: {}", file_path);
-        println!("⏱️ Tổng thời gian chạy: {:.2?}", start_time.elapsed());
-    } else {
-        println!("\n⚠️ Không có dữ liệu nào được sinh ra.");
+        // Kiểm tra luật lặp cấm
+        let rep = board.judge_repetition(&history, history.len(), 3);
+        match rep {
+            RepetitionResult::Loss => {
+                if board.side_to_move == Color::Red {
+                    reason = "Red perpetual rule loss";
+                    final_outcome_red = -1;
+                } else {
+                    reason = "Black perpetual rule loss";
+                    final_outcome_red = 1;
+                }
+                break;
+            }
+            RepetitionResult::Win => {
+                if board.side_to_move == Color::Red {
+                    reason = "Red won by opponent rule violation";
+                    final_outcome_red = 1;
+                } else {
+                    reason = "Black won by opponent rule violation";
+                    final_outcome_red = -1;
+                }
+                break;
+            }
+            RepetitionResult::Draw => {
+                reason = "Draw by perpetual check/chase";
+                final_outcome_red = 0;
+                break;
+            }
+            RepetitionResult::Undecided => {}
+        }
+
+        // Tìm kiếm các nước đi tốt nhất với Alpha-Beta + NNUE
+        let candidates = search_top_moves(&mut board, &history, depth, random_top_n, model, tt);
+        if candidates.is_empty() {
+            // Không còn nước đi hợp lệ => Bên tới lượt bị chiếu bí hoặc hết nước đi (thua)
+            if board.side_to_move == Color::Red {
+                reason = "Red checkmated / stalemate";
+                final_outcome_red = -1;
+            } else {
+                reason = "Black checkmated / stalemate";
+                final_outcome_red = 1;
+            }
+            break;
+        }
+
+        // Chọn ngẫu nhiên trong danh sách Top-N nước có điểm số cao nhất
+        let (best_move, eval_score) = *candidates.choose(&mut local_rng).unwrap();
+
+        // Lưu thế cờ trước khi đi
+        pending.push(PendingRecord {
+            board: board.clone(),
+            score: eval_score,
+            ply: ply as u16,
+            stm: board.side_to_move,
+        });
+
+        // Đi nước cờ
+        let entry = apply_move_with_history(&mut board, best_move);
+        history.push(entry);
+        ply += 1;
+    }
+
+    // Gán kết quả chung cuộc cho toàn bộ các thế cờ trong ván đấu
+    let mut records = Vec::with_capacity(pending.len());
+    for p in pending {
+        let outcome = match p.stm {
+            Color::Red => final_outcome_red,
+            Color::Black => -final_outcome_red,
+        };
+        let rec = WisdomBinRecord::new(&p.board, p.score, outcome, p.ply);
+        records.push(rec);
+    }
+
+    (records, reason)
+}
+
+/// Cơ chế Replay Buffer First In First Out (FIFO):
+/// Giữ kích thước buffer luôn ổn định ở mức tối đa max_records (mặc định 1 triệu positions).
+/// Cắt bỏ các ván cờ cũ nhất ở đầu file khi buffer vượt ngưỡng.
+fn enforce_fifo_buffer_limit(path: &Path, max_records: usize) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let file_size = std::fs::metadata(path)?.len() as usize;
+    let total_records = file_size / RECORD_SIZE;
+    if total_records <= max_records {
+        return Ok(());
+    }
+
+    let records_to_drop = total_records - max_records;
+    let drop_bytes = (records_to_drop * RECORD_SIZE) as u64;
+
+    println!(
+        "\n♻️ Replay Buffer FIFO: Tổng {} positions vượt giới hạn chuẩn {} positions.",
+        total_records, max_records
+    );
+    println!(
+        "   ↳ Cắt bỏ {} positions cũ nhất (FIFO: First-In First-Out)...",
+        records_to_drop
+    );
+
+    let temp_path = path.with_extension("tmp_fifo");
+    {
+        let mut reader = std::fs::File::open(path)?;
+        reader.seek(SeekFrom::Start(drop_bytes))?;
+        let mut writer = std::fs::File::create(&temp_path)?;
+        std::io::copy(&mut reader, &mut writer)?;
+        writer.flush()?;
+    }
+
+    std::fs::rename(&temp_path, path)?;
+    let new_size_mb = (max_records * RECORD_SIZE) as f32 / (1024.0 * 1024.0);
+    println!(
+        "   ✅ Đã đồng bộ Buffer về đúng {} positions ({:.2} MB)!",
+        max_records, new_size_mb
+    );
+    Ok(())
+}
+
+fn main() {
+    let config = parse_args();
+
+    println!("===============================================================");
+    println!("⚡️ WISDOM SELF-PLAY GAME GENERATOR (ALPHA-BETA + NNUE)");
+    println!("🎮 Số ván đấu mục tiêu: {}", config.num_games);
+    println!("🧵 Số luồng CPU song song: {}", config.num_threads);
+    println!("🔍 Độ sâu tìm kiếm (Depth): {} plies", config.search_depth);
+    println!("🎲 Chọn nước ngẫu nhiên: Top {} nước điểm số cao nhất (toàn bộ ván)", config.random_top_n);
+    println!("♻️ Replay Buffer FIFO tối đa: {} positions (~{:.1} MB)", config.max_buffer_size, (config.max_buffer_size * RECORD_SIZE) as f32 / (1024.0 * 1024.0));
+    println!("📦 File xuất nhị phân: {:?}", config.output_path);
+    println!("🧠 Model NNUE: {:?}", config.model_path);
+    println!("===============================================================");
+
+    // Đảm bảo thư mục đầu ra tồn tại
+    if let Some(parent) = config.output_path.parent() {
+        std::fs::create_dir_all(parent).unwrap_or(());
+    }
+
+    // Nạp NNUE model
+    let model = match NNUEModel::load_from_file(&config.model_path) {
+        Ok(m) => Arc::new(m),
+        Err(e) => {
+            eprintln!("❌ Lỗi: Không thể tải mô hình NNUE từ {:?}: {}", config.model_path, e);
+            eprintln!("💡 Gợi ý: Hãy kiểm tra file model hoặc chạy script train để tạo model khởi điểm.");
+            std::process::exit(1);
+        }
+    };
+
+    let games_completed = Arc::new(AtomicUsize::new(0));
+    let total_positions = Arc::new(AtomicUsize::new(0));
+    let red_wins = Arc::new(AtomicUsize::new(0));
+    let black_wins = Arc::new(AtomicUsize::new(0));
+    let draws = Arc::new(AtomicUsize::new(0));
+
+    // File writer được bảo vệ bởi Mutex
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.output_path)
+        .expect("Không thể mở file nhị phân đầu ra");
+    let file_writer = Arc::new(Mutex::new(BufWriter::with_capacity(1024 * 1024, file)));
+
+    let start_time = Instant::now();
+    let mut handles = Vec::new();
+
+    for _thread_id in 0..config.num_threads {
+        let model_clone = Arc::clone(&model);
+        let games_comp = Arc::clone(&games_completed);
+        let total_pos = Arc::clone(&total_positions);
+        let r_wins = Arc::clone(&red_wins);
+        let b_wins = Arc::clone(&black_wins);
+        let d_draws = Arc::clone(&draws);
+        let writer_clone = Arc::clone(&file_writer);
+
+        let target_games = config.num_games;
+        let depth = config.search_depth;
+        let random_top_n = config.random_top_n;
+        let max_plies = config.max_game_plies;
+
+        handles.push(thread::spawn(move || {
+            let mut tt = TranspositionTableAB::new(16); // 16MB TT per thread
+
+            loop {
+                let current_game = games_comp.fetch_add(1, Ordering::SeqCst);
+                if current_game >= target_games {
+                    break;
+                }
+
+                let (records, _reason) = play_one_game(&model_clone, &mut tt, depth, random_top_n, max_plies);
+
+                if let Some(last_rec) = records.last() {
+                    // Xác định bên thắng
+                    if last_rec.outcome > 0 {
+                        if last_rec.side_to_move == 0 {
+                            r_wins.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            b_wins.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else if last_rec.outcome < 0 {
+                        if last_rec.side_to_move == 0 {
+                            b_wins.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            r_wins.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        d_draws.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                let num_pos = records.len();
+                total_pos.fetch_add(num_pos, Ordering::Relaxed);
+
+                // Ghi vào file nhị phân
+                {
+                    let mut writer = writer_clone.lock().unwrap();
+                    for rec in &records {
+                        writer.write_all(rec.as_bytes()).unwrap();
+                    }
+                }
+
+                let finished = current_game + 1;
+                let elapsed = start_time.elapsed().as_secs_f32();
+                let gps = finished as f32 / elapsed.max(0.001);
+                let pos_count = total_pos.load(Ordering::Relaxed);
+                let pps = pos_count as f32 / elapsed.max(0.001);
+
+                if finished % 5 == 0 || finished == target_games {
+                    println!(
+                        "[{:>3}/{:>3}] {:5.1}s | {:.1} games/s | {:6.0} pos/s | Tổng positions: {:6} | Đỏ: {} Đen: {} Hòa: {}",
+                        finished,
+                        target_games,
+                        elapsed,
+                        gps,
+                        pps,
+                        pos_count,
+                        r_wins.load(Ordering::Relaxed),
+                        b_wins.load(Ordering::Relaxed),
+                        d_draws.load(Ordering::Relaxed)
+                    );
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Flush & close file writer trước khi kiểm tra FIFO
+    {
+        let mut writer = file_writer.lock().unwrap();
+        writer.flush().unwrap();
+    }
+    drop(file_writer);
+
+    let elapsed = start_time.elapsed().as_secs_f32();
+    let session_pos = total_positions.load(Ordering::SeqCst);
+
+    println!("\n🎉 HOÀN TẤT SINH DỮ LIỆU TỰ CHƠI TRONG {:.2} GIÂY!", elapsed);
+    println!("📊 Số vị trí sinh mới trong lượt này: {} positions", session_pos);
+    println!(
+        "🏆 Tỉ lệ kết quả: Đỏ thắng {} | Đen thắng {} | Hòa {}",
+        red_wins.load(Ordering::SeqCst),
+        black_wins.load(Ordering::SeqCst),
+        draws.load(Ordering::SeqCst)
+    );
+
+    // Áp dụng cơ chế FIFO Replay Buffer
+    if let Err(e) = enforce_fifo_buffer_limit(&config.output_path, config.max_buffer_size) {
+        eprintln!("⚠️ Cảnh báo: Lỗi khi xử lý FIFO Replay Buffer: {}", e);
     }
 }

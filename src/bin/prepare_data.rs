@@ -39,7 +39,7 @@ fn main() {
     println!("============================================================");
     println!("📦 Lấy toàn bộ data mới từ : v{}", latest_v);
 
-    let mut latest_data = read_all_csv_in_dir(&latest_dir);
+    let latest_data = read_all_csv_in_dir(&latest_dir);
     println!("   ↳ Thu được: {} FENs", latest_data.len());
 
     // 🎯 THAY ĐỔI 2: Đặt giới hạn cho Replay Buffer (Cửa sổ trượt)
