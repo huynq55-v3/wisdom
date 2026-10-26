@@ -6,7 +6,7 @@ use crate::ab_tt::{
     TranspositionTableAB, TT_FLAG_EXACT, TT_FLAG_LOWER, TT_FLAG_UPPER, VALUE_MATE,
     VALUE_MATE_THRESHOLD,
 };
-use crate::board::{Board, Color, HistoryEntry, PieceType};
+use crate::board::{Board, Color, HistoryEntry, PieceType, RepetitionResult};
 use crate::nnue::{Accumulator, NNUEModel};
 use crate::r#move::Move;
 
@@ -51,6 +51,9 @@ pub struct SearchState<'a> {
     pub stop_signal: Option<Arc<AtomicBool>>,
     pub stopped: bool,
     pub game_history: Vec<u64>,
+    pub real_history: &'a [HistoryEntry],
+    pub root_board: Board,
+    pub current_root_move: Option<Move>,
 }
 
 impl<'a> SearchState<'a> {
@@ -58,6 +61,8 @@ impl<'a> SearchState<'a> {
         nnue: &'a NNUEModel,
         tt: &'a mut TranspositionTableAB,
         stop_signal: Option<Arc<AtomicBool>>,
+        real_history: &'a [HistoryEntry],
+        root_board: &Board,
     ) -> Self {
         Self {
             nnue,
@@ -72,6 +77,9 @@ impl<'a> SearchState<'a> {
             stop_signal,
             stopped: false,
             game_history: Vec::new(),
+            real_history,
+            root_board: root_board.clone(),
+            current_root_move: None,
         }
     }
 
@@ -302,7 +310,46 @@ pub fn negamax_pvs(
             if past_hash == board.zobrist_key {
                 rep_count += 1;
                 if rep_count >= 1 {
-                    return VALUE_DRAW; // Hòa do lặp nước
+                    // a) Nếu bên đang tới lượt bị chiếu (in_check) -> Đối phương vừa đi nước chiếu để tạo thế lặp.
+                    // Theo luật cờ tướng: Bên chiếu phạm luật trường chiếu cấm (THUA), bên bị chiếu THẮNG!
+                    if in_check {
+                        return VALUE_MATE - (ply as i16);
+                    }
+
+                    // b) Nếu ở ply == 1 (nước đi trực tiếp từ Root) lặp lại với lịch sử ván cờ thật:
+                    // Dùng trực tiếp bộ trọng tài judge_repetition để phân xử xem nước đi này có phạm luật đuổi bắt cấm không!
+                    if ply == 1 && !state.real_history.is_empty() {
+                        if let Some(root_m) = state.current_root_move {
+                            let mut temp_board = state.root_board.clone();
+                            let entry = crate::ucci::apply_move_with_history(&mut temp_board, root_m);
+                            let mut temp_history = Vec::with_capacity(state.real_history.len() + 1);
+                            temp_history.extend_from_slice(state.real_history);
+                            temp_history.push(entry);
+
+                            let rep_res = board.judge_repetition(&temp_history, temp_history.len(), 2);
+                            match rep_res {
+                                RepetitionResult::Win => {
+                                    // Đối phương tại ply 1 THẮNG (vì bên tại Root phạm luật cấm)
+                                    return VALUE_MATE - 1;
+                                }
+                                RepetitionResult::Loss => {
+                                    // Đối phương tại ply 1 THUA (vì đối phương phạm luật cấm)
+                                    return -VALUE_MATE + 1;
+                                }
+                                RepetitionResult::Draw => {
+                                    // Trọng tài chính thức xử hòa do lặp hợp lệ (hai bên đi nước nhàn đủ số lần)
+                                    return VALUE_DRAW;
+                                }
+                                RepetitionResult::Undecided => {
+                                    // Trọng tài chưa xử (chưa chạm ngưỡng quy định):
+                                    // Tuyệt đối không gán 0 cp (Hòa giả tạo)! Trả về đúng điểm đánh giá thực tế của bàn cờ!
+                                    return state.nnue.evaluate_cp(board, &state.acc_stack[ply]);
+                                }
+                            }
+                        }
+                    }
+
+                    return VALUE_DRAW; // Hòa do lặp nước hợp lệ
                 }
             }
         }
@@ -389,6 +436,9 @@ pub fn negamax_pvs(
 
     for (m, move_score) in &scored_moves {
         let m = *m;
+        if is_root {
+            state.current_root_move = Some(m);
+        }
         let from_sq = m.from_sq();
         let to_sq = m.to_sq();
         let captured = board.piece_at(to_sq);
@@ -584,7 +634,7 @@ pub fn search_best_move_with_callback<F>(
 where
     F: FnMut(&SearchProgress),
 {
-    let mut state = SearchState::new(nnue, tt, stop_signal);
+    let mut state = SearchState::new(nnue, tt, stop_signal, history, board);
     state.time_limit_ms = time_limit_ms;
 
     // Nạp lịch sử ván cờ vào để kiểm tra lặp cờ
@@ -758,7 +808,7 @@ pub fn search_top_moves(
     let mut scored_moves: Vec<(Move, i16)> = Vec::with_capacity(legal_moves.len());
     scored_moves.push((best_move, res.score));
 
-    let mut state = SearchState::new(nnue, tt, None);
+    let mut state = SearchState::new(nnue, tt, None, history, board);
     for h in history {
         state.game_history.push(h.hash);
     }
@@ -785,6 +835,7 @@ pub fn search_top_moves(
             state.acc_stack[1] = state.acc_stack[0];
             state.acc_stack[1].update_move(board, moving_piece, from_sq, to_sq, captured, nnue);
             state.game_history.push(board.zobrist_key);
+            state.current_root_move = Some(m);
 
             let s = -negamax_pvs(
                 board,

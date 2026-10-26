@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import struct
+import shutil
 import argparse
 import numpy as np
 import pandas as pd
@@ -23,7 +24,7 @@ NUM_FEATURES = NUM_KING_SQ * NUM_PIECE_TYPES * NUM_BOARD_SQ  # 9 * 14 * 90 = 11,
 PADDING_IDX = NUM_FEATURES
 MAX_PIECES_PER_BOARD = 32
 
-L1_DIM = 256
+L1_DIM = 512
 L2_DIM = 32
 L3_DIM = 32
 
@@ -221,9 +222,17 @@ class WisdomBinDataset(Dataset):
         score = float(rec['score'])
         outcome = float(rec['outcome'])
 
-        # Stockfish target blend: kết hợp giữa search evaluation và kết quả game
-        # Score chuẩn hóa bằng hàm tanh (600 cp xấp xỉ tỉ lệ thắng cao)
-        score_val = np.tanh(score / 600.0)
+        # Chuẩn hóa search score về [-1.0, 1.0] tương ứng với không gian đầu ra tanh của WisdomNNUE.
+        # Ở Rust engine: evaluate_cp = evaluate() * 1000.0 nên score_val = score / 1000.0.
+        # Tuyệt đối không dùng thêm hàm np.tanh(score / 600.0) để tránh lỗi Double Tanh Compression.
+        if score >= 10000:
+            score_val = 1.0
+        elif score <= -10000:
+            score_val = -1.0
+        else:
+            score_val = np.clip(score / 1000.0, -1.0, 1.0)
+
+        # Target blend: kết hợp giữa search evaluation (80%) và kết quả game (20%)
         target = 0.8 * score_val + 0.2 * outcome
         target = np.float32(np.clip(target, -1.0, 1.0))
 
@@ -363,8 +372,8 @@ def export_quantized_binary(model, output_path="wisdom_models/wisdom_nnue.bin"):
 def init_model_scratch(output_dir):
     os.makedirs(output_dir, exist_ok=True)
     model = WisdomNNUE()
-    # Khởi tạo trọng số chuẩn NNUE
-    nn.init.normal_(model.ft.weight, mean=0.0, std=0.01)
+    # Khởi tạo trọng số chuẩn NNUE: std=0.08 để khi lượng tử hóa QA=255.0 không bị triệt tiêu neuron
+    nn.init.normal_(model.ft.weight, mean=0.0, std=0.08)
     nn.init.zeros_(model.ft_bias)
     nn.init.kaiming_normal_(model.fc0.weight, nonlinearity='relu')
     nn.init.zeros_(model.fc0.bias)
@@ -419,18 +428,21 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4096, help="Batch size")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate (mặc định: 1e-3 nếu scratch, 3e-4 nếu resume)")
     parser.add_argument("--output-dir", type=str, default="wisdom_models", help="Thư mục lưu model")
+    parser.add_argument("--resume", type=str, default=None, help="Đường dẫn file checkpoint .pt cụ thể để tiếp tục huấn luyện (ví dụ: wisdom_models/archive/gen1.pt)")
+    parser.add_argument("--name", type=str, default="wisdom_nnue", help="Tên model khi lưu kết quả (mặc định: wisdom_nnue)")
     parser.add_argument("--init-scratch", action="store_true", help="Bắt buộc khởi tạo model mới từ đầu thay vì resume")
     parser.add_argument("--init-only", action="store_true", help="Chỉ khởi tạo model scratch rồi thoát, không train")
     parser.add_argument("--max-samples", type=int, default=None, help="Giới hạn số mẫu nạp để test nhanh")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    pt_path = os.path.join(args.output_dir, "wisdom_nnue_best.pt")
-    bin_path = os.path.join(args.output_dir, "wisdom_nnue.bin")
+    model_name = args.name
+    pt_path = os.path.join(args.output_dir, f"{model_name}_best.pt")
+    bin_path = os.path.join(args.output_dir, f"{model_name}.bin")
 
     # Nếu chỉ yêu cầu tạo model khởi điểm
     if args.init_only:
-        print("🌱 Đang tạo mô hình khởi điểm từ Scratch...")
+        print(f"🌱 Đang tạo mô hình khởi điểm từ Scratch ({model_name})...")
         init_model_scratch(args.output_dir)
         print("✅ Hoàn tất khởi tạo mô hình!")
         return
@@ -439,18 +451,44 @@ def main():
 
     # 1. Quản lý mô hình: Scratch vs Continuous Training (Resume)
     is_resumed = False
+    default_resume_pt = os.path.join(args.output_dir, "wisdom_nnue_best.pt")
+
     if args.init_scratch:
         print("🌱 Bắt đầu huấn luyện mô hình MỚI HOÀN TOÀN (From Scratch)...")
         model = init_model_scratch(args.output_dir).to(device)
         default_lr = 0.001
-    elif os.path.exists(pt_path):
-        print(f"🔄 Phát hiện checkpoint cũ tại: {pt_path}")
-        print("🚀 Tiếp tục huấn luyện (Fine-Tuning / Warm-Start) từ model cũ!")
+    elif args.resume is not None:
+        if not os.path.exists(args.resume):
+            print(f"❌ Không tìm thấy file checkpoint chỉ định: {args.resume}")
+            sys.exit(1)
+        print(f"🔄 Tiếp tục huấn luyện từ checkpoint chỉ định: {args.resume}")
         model = WisdomNNUE().to(device)
-        state_dict = torch.load(pt_path, map_location=device, weights_only=True)
-        model.load_state_dict(state_dict)
-        default_lr = 0.0003  # Learning rate nhỏ hơn để fine-tune
-        is_resumed = True
+        state_dict = torch.load(args.resume, map_location=device, weights_only=True)
+        try:
+            model.load_state_dict(state_dict)
+            default_lr = 0.0003  # Learning rate nhỏ hơn để fine-tune
+            is_resumed = True
+        except RuntimeError as e:
+            print(f"⚠️ Checkpoint chỉ định {args.resume} có cấu trúc kích thước khác với kiến trúc mới (L1={L1_DIM})!")
+            print(f"🌱 Tự động khởi tạo mô hình mới (From Scratch) với L1={L1_DIM}...")
+            model = init_model_scratch(args.output_dir).to(device)
+            default_lr = 0.001
+            is_resumed = False
+    elif os.path.exists(default_resume_pt):
+        print(f"🔄 Phát hiện checkpoint mặc định tại: {default_resume_pt}")
+        model = WisdomNNUE().to(device)
+        state_dict = torch.load(default_resume_pt, map_location=device, weights_only=True)
+        try:
+            model.load_state_dict(state_dict)
+            print("🚀 Tiếp tục huấn luyện (Fine-Tuning / Warm-Start) từ model cũ!")
+            default_lr = 0.0003  # Learning rate nhỏ hơn để fine-tune
+            is_resumed = True
+        except RuntimeError as e:
+            print(f"⚠️ Checkpoint cũ {default_resume_pt} là kiến trúc cũ (L1=256), không khớp với kiến trúc mới (L1={L1_DIM})!")
+            print(f"🌱 Tự động khởi tạo mô hình mới (From Scratch) với L1={L1_DIM}...")
+            model = init_model_scratch(args.output_dir).to(device)
+            default_lr = 0.001
+            is_resumed = False
     else:
         print("⚠️ Không tìm thấy checkpoint cũ. Khởi tạo mô hình mới từ Scratch...")
         model = init_model_scratch(args.output_dir).to(device)
@@ -536,6 +574,13 @@ def main():
 
     # 4. Xuất file binary lượng tử hóa cho Rust engine
     export_quantized_binary(model, bin_path)
+    if model_name != "wisdom_nnue":
+        default_bin = os.path.join(args.output_dir, "wisdom_nnue.bin")
+        default_pt = os.path.join(args.output_dir, "wisdom_nnue_best.pt")
+        shutil.copyfile(bin_path, default_bin)
+        if os.path.exists(pt_path):
+            shutil.copyfile(pt_path, default_pt)
+        print(f"🔗 Đồng thời cập nhật vào model mặc định: {default_bin}")
     print("\n🎉 HUẤN LUYỆN HOÀN TẤT THÀNH CÔNG! ĐÃ CẬP NHẬT MÔ HÌNH VÀO WISDOM ENGINE! 🚀")
 
 
